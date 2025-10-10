@@ -186,12 +186,17 @@ class MongoChatStore:
             "updated_at": 1,
             "metadata": 1,
         }
-        query: Dict[str, Any] = {}
+        query_clauses: List[Dict[str, Any]] = [{"chats.0": {"$exists": True}}]
         if user_id is not None:
-            query = {"$or": [
+            query_clauses.append({"$or": [
                 {"user_id": user_id},
                 {"user_id": {"$exists": False}, "metadata.user_id": user_id},
-            ]}
+            ]})
+        query: Dict[str, Any]
+        if len(query_clauses) == 1:
+            query = query_clauses[0]
+        else:
+            query = {"$and": query_clauses}
         cur = self.col.find(query, projection).sort("updated_at", -1).limit(limit)
         return list(cur)
 
