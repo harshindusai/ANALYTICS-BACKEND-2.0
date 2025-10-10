@@ -1,0 +1,13 @@
+
+fastapi
+uvicorn[standard]
+pymongo
+numpy
+pandas
+plotly
+python-dotenv
+psycopg2-binary
+openai
+langfuse
+livekit
+livekit-api

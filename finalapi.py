@@ -1,5 +1,6 @@
 
-from typing import Dict, Any, List, Optional
+import asyncio
+from typing import Dict, Any, List, Optional, Literal
 from decimal import Decimal
 from bson.decimal128 import Decimal128
 import uuid
@@ -11,23 +12,28 @@ import hashlib
 import datetime
 import re
 import logging
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, status, Request, Depends
+from fastapi import FastAPI, HTTPException, status, Request, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone, date, time
+import numpy as np
 
 
 # Import your existing classes (assuming they're in main.py)
 from groqnopenai import (
     SmartNL2SQLProcessor,
     DashboardQueryEngine,
-    SilentVoiceInputAdapter,
-    SilentVoiceOutputAdapter,
 )
-from mongo_store import MongoChatStore, new_transcript_id, new_chat_id
-from voice_agent import VoiceAgent, OpenAIVoiceInputAdapter, OpenAIVoiceOutputAdapter
+from mongo_store import MongoChatStore
+from livekit_manager import (
+    LiveKitSessionManager,
+    LiveKitConfigurationError,
+    LiveKitSessionNotFound,
+)
 
 OPENAPI_TAGS = [
     {"name": "General", "description": "Utility and informational endpoints for service discovery."},
@@ -36,6 +42,7 @@ OPENAPI_TAGS = [
     {"name": "Query", "description": "Natural-language query processing and related data retrieval APIs."},
     {"name": "Transcripts", "description": "Transcript lifecycle management and chat retrieval."},
     {"name": "Dashboard", "description": "User dashboard graph management APIs."},
+    {"name": "LiveKit", "description": "Realtime voice agent session management APIs."},
 ]
 
 app = FastAPI(
@@ -98,43 +105,112 @@ class DescriptionResponse(BaseModel):
     query_executed_successfully: bool
 
 class GraphItem(BaseModel):
-    html_content: str
+    type: str
     graph_type: Optional[str] = None
-    file_path: Optional[str] = None
+    title: Optional[str] = None
+    figure: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None
+    summary: Optional[Dict[str, Any]] = None
+    query: Optional[str] = None
+    insight: Optional[str] = None
+    sub_query_index: Optional[int] = None
+    html: Optional[str] = None
 
 class GraphsResponse(BaseModel):
     transcript_id: str
     chat_id: str
     graphs: List[GraphItem]
-    # Back-compat for old clients that expect a single graph
-    html_content: Optional[str] = None
-    graph_type: Optional[str] = None
-    file_path: Optional[str] = None
+
+class LiveKitSessionCreateRequest(BaseModel):
+    display_name: Optional[str] = None
+
+
+class LiveKitSessionStartResponse(BaseModel):
+    session_id: str
+    room_name: str
+    participant_identity: str
+    token: str
+    url: str
+    display_name: str
+    created_at: datetime
+    expires_at: datetime
+    transcripts: List[Dict[str, Any]]
+
+
+class LiveKitTranscriptIngest(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    text: str
+    timestamp: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class LiveKitQueryRequest(BaseModel):
+    question: str
+    context: Optional[str] = None
+
+
+class LiveKitTokenRequest(BaseModel):
+    display_name: Optional[str] = None
+
+
+class LiveKitTokenResponse(BaseModel):
+    session_id: str
+    room_name: str
+    participant_identity: str
+    token: str
+    url: str
+    expires_at: datetime
+
 
 processor = SmartNL2SQLProcessor()
 dashboard_query_engine = DashboardQueryEngine(store=store)
-VOICE_ENABLED = os.getenv("VOICE_ENABLED", "true").lower() not in {"false", "0", "no"}
+livekit_manager = LiveKitSessionManager(store=store)
 
-if VOICE_ENABLED:
-    try:
-        voice_input_adapter = OpenAIVoiceInputAdapter()
-        voice_output_adapter = OpenAIVoiceOutputAdapter()
-    except Exception as voice_error:
-        logger.warning("Falling back to silent voice adapters: %s", voice_error)
-        voice_input_adapter = SilentVoiceInputAdapter()
-        voice_output_adapter = SilentVoiceOutputAdapter()
-else:
-    voice_input_adapter = SilentVoiceInputAdapter()
-    voice_output_adapter = SilentVoiceOutputAdapter()
 
-voice_agent = VoiceAgent(
-    store=store,
-    processor=processor,
-    dashboard_engine=dashboard_query_engine,
-    voice_input=voice_input_adapter,
-    voice_output=voice_output_adapter,
+def _resolve_livekit_client_bundle() -> Optional[str]:
+    configured = os.getenv("LIVEKIT_CLIENT_BUNDLE_PATH", "").strip()
+    candidates: List[Path] = []
+    project_root = Path(__file__).resolve().parent
+    cwd_root = Path.cwd()
+
+    if configured:
+        path = Path(configured).expanduser()
+        candidates.append(path)
+        if path.is_dir():
+            candidates.append(path / "livekit-client.esm.min.js")
+
+    default_candidates = [
+        project_root / "livekit-client.esm.min.js",
+        project_root / "static" / "livekit-client.esm.min.js",
+        cwd_root / "livekit-client.esm.min.js",
+        cwd_root / "static" / "livekit-client.esm.min.js",
+        project_root / "node_modules" / "livekit-client" / "dist" / "livekit-client.esm.min.js",
+        cwd_root / "node_modules" / "livekit-client" / "dist" / "livekit-client.esm.min.js",
+    ]
+    candidates.extend(default_candidates)
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if resolved.is_file():
+            return str(resolved)
+
+    logger.warning("LiveKit client bundle not found. Checked: %s", ", ".join(str(c) for c in candidates))
+    return None
+
+
+@app.get(
+    "/livekit/client",
+    tags=["LiveKit"],
+    summary="Serve LiveKit browser SDK bundle",
 )
-
+async def serve_livekit_client() -> FileResponse:
+    bundle_path = _resolve_livekit_client_bundle()
+    if not bundle_path:
+        raise HTTPException(status_code=404, detail="LiveKit client bundle not configured")
+    return FileResponse(bundle_path, media_type="application/javascript")
 
 class DashboardGraphsPayload(BaseModel):
     graphs: List[Dict[str, Any]]
@@ -152,6 +228,10 @@ class DashboardGraphMetadataModel(BaseModel):
     row_count: Optional[int] = None
     fields: Optional[List[str]] = None
     last_synced_at: Optional[str] = None
+    figure: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None
+    summary: Optional[Dict[str, Any]] = None
+    html_content: Optional[str] = None
 
 
 class DashboardGraphRegistrationRequest(DashboardGraphMetadataModel):
@@ -190,25 +270,6 @@ class DashboardGraphQueryResponse(BaseModel):
     updated: Optional[int] = None
     scope: Optional[Dict[str, Any]] = None
 
-
-class VoiceSessionStartResponse(BaseModel):
-    session_id: str
-    greeting: str
-    audio: Optional[str] = None
-
-
-class VoiceAudioChunkRequest(BaseModel):
-    audio: str
-    end_of_utterance: Optional[bool] = None
-    mime_type: Optional[str] = None
-
-
-class VoiceAudioChunkResponse(BaseModel):
-    type: str
-    message: str
-    transcript: str
-    audio: str
-    payload: Optional[Dict[str, Any]] = None
 
 # -----------------
 # Auth helpers
@@ -281,11 +342,31 @@ def _require_user(http: Request) -> Dict[str, Any]:
     return user
 
 
+def _require_agent(http: Request) -> None:
+    expected = os.getenv("LIVEKIT_AGENT_API_KEY")
+    if not expected:
+        raise HTTPException(status_code=503, detail="LiveKit agent API key is not configured.")
+    provided = http.headers.get("x-agent-key") or http.headers.get("X-Agent-Key")
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid agent credentials")
+
+
 def _to_bson_safe(obj: Any) -> Any:
     """Recursively convert Python objects to Mongo/BSON-safe values.
     - Decimal -> Decimal128 to preserve precision
     - Lists/Dicts traversed recursively
     """
+    if isinstance(obj, datetime):
+        # Mongo expects naive UTC timestamps
+        if obj.tzinfo is not None:
+            obj = obj.astimezone(timezone.utc).replace(tzinfo=None)
+        return obj
+    if isinstance(obj, date) and not isinstance(obj, datetime):
+        return datetime.combine(obj, time.min)
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return [_to_bson_safe(x) for x in obj.tolist()]
     if isinstance(obj, Decimal):
         # Convert to Decimal128 for MongoDB
         return Decimal128(str(obj))
@@ -334,46 +415,10 @@ def _to_json_safe(obj: Any) -> Any:
     return obj
 
 
-def _build_html_card_html(description: str, title: Optional[str] = None) -> str:
-    safe_title = (title or "Insight").strip() or "Insight"
-    safe_desc = (description or "").strip() or "No additional details provided."
-    return f"""
-<!doctype html>
-<html lang=\"en\">
-  <head>
-    <meta charset=\"utf-8\" />
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-    <title>{safe_title}</title>
-    <style>
-      :root {{ --bg:#0b1220; --card:#0f172a; --fg:#e2e8f0; --muted:#94a3b8; }}
-      html,body{{margin:0;padding:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Inter,Roboto,sans-serif}}
-      .wrap{{padding:16px}}
-      .card{{background:linear-gradient(180deg,rgba(20,184,166,.08),rgba(59,130,246,.08));border:1px solid rgba(255,255,255,.08);border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.25);overflow:hidden}}
-      .header{{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02)}}
-      .dot{{width:8px;height:8px;border-radius:9999px;background:#14b8a6;box-shadow:0 0 0 2px rgba(20,184,166,.25)}}
-      .title{{font-size:14px;font-weight:600;letter-spacing:.2px}}
-      .body{{padding:18px 16px 20px;line-height:1.6;font-size:14px}}
-      .muted{{color:var(--muted)}}
-    </style>
-  </head>
-  <body>
-    <div class=\"wrap\"><div class=\"card\">
-      <div class=\"header\"><div class=\"dot\"></div><div class=\"title\">{safe_title}</div></div>
-      <div class=\"body\"><div>{safe_desc}</div></div>
-    </div></div>
-  </body>
-</html>
-"""
+
 
 
 def _derive_graph_title_from_context(ctx: Dict[str, Any], fallback_prefix: str, index: int) -> str:
-    html_blob = ctx.get("html") or ""
-    if html_blob:
-        match = re.search(r"<title>(.*?)</title>", html_blob, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            candidate = match.group(1).strip()
-            if candidate:
-                return candidate[:160]
     for key in ("title", "insight", "query"):
         candidate = (ctx.get(key) or "").strip()
         if candidate:
@@ -411,32 +456,41 @@ def _collect_graph_metadata_payloads(
     if graph_contexts:
         for idx, ctx in enumerate(graph_contexts):
             title = _derive_graph_title_from_context(ctx, "Visualization", idx)
+            figure_payload = ctx.get("figure")
+            summary_payload = ctx.get("summary")
             payloads.append({
                 "title": title,
-                "graph_type": ctx.get("chart_type") or result.get("graph_type"),
-                "data_source": ctx.get("file_path"),
+                "graph_type": ctx.get("graph_type"),
+                "data_source": None,
                 "data": _match_data_for_context(ctx, result),
                 "description": ctx.get("insight"),
-                "html_content": ctx.get("html") or _load_graph_html(ctx.get("file_path")),
+                "figure": figure_payload,
+                "config": ctx.get("config"),
+                "summary": summary_payload,
+                "html_content": ctx.get("html"),
                 "metadata": {
                     "query": ctx.get("query"),
                     "insight": ctx.get("insight"),
-                    "file_path": ctx.get("file_path"),
                     "transcript_id": transcript_id,
                     "chat_id": chat_id,
                     "user_query": user_query,
+                    "sub_query_index": ctx.get("sub_query_index"),
                 },
                 "active": True,
             })
-    elif result.get("execution_results"):
-        title = (result.get("description") or result.get("user_request") or user_query or "Visualization").strip()
+    elif result.get("visualization"):
+        viz = result["visualization"]
+        title = (viz.get("title") or result.get("description") or result.get("user_request") or user_query or "Visualization").strip()
         payloads.append({
             "title": title[:160],
-            "graph_type": result.get("graph_type"),
-            "data_source": result.get("graph_file"),
+            "graph_type": viz.get("graph_type") or viz.get("type"),
+            "data_source": None,
             "data": result.get("execution_results"),
             "description": result.get("description"),
-            "html_content": result.get("graph_html") or _load_graph_html(result.get("graph_file")),
+            "figure": viz.get("figure"),
+            "config": viz.get("config"),
+            "summary": viz if viz.get("type") == "summary_card" else None,
+            "html_content": viz.get("html"),
             "metadata": {
                 "query": result.get("executed_sub_query") or result.get("user_request") or user_query,
                 "transcript_id": transcript_id,
@@ -447,17 +501,8 @@ def _collect_graph_metadata_payloads(
     return payloads
 
 
-def _load_graph_html(file_path: Optional[str]) -> Optional[str]:
-    if not file_path:
-        return None
-    candidate = file_path
-    if not os.path.isabs(candidate):
-        candidate = os.path.abspath(os.path.join(os.getcwd(), candidate))
-    try:
-        with open(candidate, "r", encoding="utf-8") as fh:
-            return fh.read()
-    except Exception:
-        return None
+
+
 
 @app.post(
     "/process_query",
@@ -587,9 +632,9 @@ async def process_query(request: QueryRequest, http: Request = None):
             description_text = "No data was found matching your query criteria."
 
         graph_contexts: List[Dict[str, Any]] = []
-        viz_list = result.get('visualizations') or []
-        if isinstance(viz_list, dict):
-            viz_list = [viz_list]
+        viz_list_raw = result.get('visualizations') or []
+        if isinstance(viz_list_raw, dict):
+            viz_list_raw = [viz_list_raw]
 
         sub_results_index: Dict[Any, Dict[str, Any]] = {}
         for sub_res in result.get('sub_results') or []:
@@ -602,24 +647,45 @@ async def process_query(request: QueryRequest, http: Request = None):
             if original_query_key:
                 sub_results_index[original_query_key] = sub_res
 
-        def _append_context(chart_type: Optional[str], file_path: Optional[str], html: Optional[str], query: Optional[str], insight: Optional[str], sub_index: Optional[int] = None, title: Optional[str] = None) -> None:
+        def _append_context(payload: Optional[Dict[str, Any]], query: Optional[str], insight: Optional[str], sub_index: Optional[int] = None) -> None:
+            if not payload:
+                return
+            html_blob = payload.get('html') or payload.get('html_content')
+            payload_type = payload.get('type')
+            if not payload_type:
+                if payload.get('figure'):
+                    payload_type = 'plotly'
+                elif payload.get('summary'):
+                    payload_type = 'summary_card'
+                elif html_blob:
+                    payload_type = 'html'
+                else:
+                    payload_type = 'plotly'
+            summary_payload = payload.get('summary')
+            if payload_type == 'summary_card' and not summary_payload:
+                summary_payload = payload
             graph_contexts.append({
-                "chart_type": chart_type,
-                "file_path": file_path,
-                "html": html,
+                "type": payload_type,
+                "graph_type": payload.get('graph_type') or payload.get('type'),
+                "title": payload.get('title'),
+                "figure": payload.get('figure'),
+                "config": payload.get('config'),
+                "summary": summary_payload,
                 "query": query,
                 "insight": insight,
                 "sub_query_index": sub_index,
-                "title": title,
+                "html": html_blob,
             })
 
-        if isinstance(viz_list, list) and viz_list:
-            for viz in viz_list:
+        if viz_list_raw:
+            for viz in viz_list_raw:
                 if not isinstance(viz, dict):
                     continue
-                file_path = viz.get('graph_file') or viz.get('file') or viz.get('file_path')
-                chart_type = viz.get('graph_type') or viz.get('type')
-                html_inline = viz.get('html') or viz.get('html_content')
+                payload = viz.get('payload') if isinstance(viz.get('payload'), dict) else None
+                if payload is None:
+                    payload = viz if any(key in viz for key in ('figure', 'summary', 'type')) else None
+                if payload is None:
+                    continue
                 sub_idx = viz.get('sub_query_index')
                 base_query = viz.get('sub_query')
                 if not base_query and sub_idx in sub_results_index:
@@ -631,27 +697,53 @@ async def process_query(request: QueryRequest, http: Request = None):
                     insight_text = sub_results_index[sub_idx].get('description')
                 elif base_query and base_query.strip().lower() in sub_results_index:
                     insight_text = sub_results_index[base_query.strip().lower()].get('description')
-                _append_context(chart_type, file_path, html_inline, base_query, insight_text, sub_index=sub_idx, title=viz.get('title'))
+                _append_context(payload, base_query, insight_text, sub_index=sub_idx)
 
-        if not graph_contexts and result.get('graph_file'):
+        if not graph_contexts and result.get('visualization'):
+            viz_payload = result['visualization']
             base_query = result.get('executed_sub_query') or result.get('original_query') or request.natural_language_query
             insight_text = result.get('description') or description_text
-            _append_context(result.get('graph_type'), result.get('graph_file'), result.get('graph_html'), base_query, insight_text, sub_index=None, title=None)
+            _append_context(viz_payload, base_query, insight_text, sub_index=None)
 
-        if graph_contexts:
-            for ctx in graph_contexts:
-                if not ctx.get('insight'):
-                    ctx['insight'] = description_text or ctx.get('query') or request.natural_language_query
+        if not graph_contexts:
+            desc_text_fallback = description_text or "No visual required."
+            graph_contexts.append({
+                "type": "summary_card",
+                "graph_type": "summary_card",
+                "title": "Insight",
+                "figure": None,
+                "config": None,
+                "summary": {
+                    "type": "summary_card",
+                    "title": "Insight",
+                    "description": desc_text_fallback,
+                    "metrics": [],
+                    "primary_metric": None,
+                    "sub_query_index": None,
+                },
+                "query": request.natural_language_query,
+                "insight": desc_text_fallback,
+                "sub_query_index": None,
+            })
+
+        for ctx in graph_contexts:
+            if not ctx.get('insight'):
+                ctx['insight'] = description_text or ctx.get('query') or request.natural_language_query
 
         for ctx in graph_contexts:
             content_items.append({
                 "type": "graph",
                 "payload": {
-                    "chart_type": ctx.get('chart_type'),
-                    "file_path": ctx.get('file_path'),
-                    "html": ctx.get('html'),
+                    "type": ctx.get('type'),
+                    "graph_type": ctx.get('graph_type'),
+                    "title": ctx.get('title'),
+                    "figure": ctx.get('figure'),
+                    "config": ctx.get('config'),
+                    "summary": ctx.get('summary'),
                     "query": ctx.get('query'),
                     "insight": ctx.get('insight'),
+                    "sub_query_index": ctx.get('sub_query_index'),
+                    "html": ctx.get('html'),
                 },
                 "meta": {},
                 "timestamp": datetime.utcnow(),
@@ -902,38 +994,41 @@ async def get_graph_html(transcript_id: str, chat_id: str, http: Request = None)
     for item in chat.get("content", []):
         if item.get("type") == "graph":
             payload = item.get("payload") or {}
-            graph_type = payload.get("chart_type")
-            html_inline = payload.get("html") or payload.get("html_content")
-            graph_file = payload.get("file_path")
-            if html_inline:
-                graphs.append(GraphItem(html_content=html_inline, graph_type=graph_type, file_path=graph_file))
-                continue
-            if graph_file:
-                try:
-                    with open(graph_file, 'r', encoding='utf-8') as f:
-                        html_content = f.read()
-                    graphs.append(GraphItem(html_content=html_content, graph_type=graph_type, file_path=graph_file))
-                except FileNotFoundError:
-                    # Skip missing files rather than failing entire response
-                    continue
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"Error reading graph file: {str(e)}")
+            graphs.append(GraphItem(
+                type=payload.get("type") or ("summary_card" if payload.get("summary") else "plotly"),
+                graph_type=payload.get("graph_type") or payload.get("type"),
+                title=payload.get("title"),
+                figure=_to_json_safe(payload.get("figure")),
+                config=_to_json_safe(payload.get("config")),
+                summary=_to_json_safe(payload.get("summary")),
+                query=payload.get("query"),
+                insight=payload.get("insight"),
+                sub_query_index=payload.get("sub_query_index"),
+                html=payload.get("html") or payload.get("html_content"),
+            ))
     if not graphs:
-        # Fallback to html_card from description so we never 404
         desc_text = ""
         for item in chat.get("content", []):
             if item.get("type") == "description":
                 desc_text = (item.get("payload") or {}).get("text") or ""
                 break
-        html_card = _build_html_card_html(desc_text or "No visual required.")
-        graphs = [GraphItem(html_content=html_card, graph_type="html_card", file_path=None)]
-    # Build response with optional single-graph fields for older clients
-    resp = GraphsResponse(transcript_id=transcript_id, chat_id=chat_id, graphs=graphs)
-    if len(graphs) == 1:
-        resp.html_content = graphs[0].html_content
-        resp.graph_type = graphs[0].graph_type
-        resp.file_path = graphs[0].file_path
-    return resp
+        summary_payload = {
+            "type": "summary_card",
+            "title": "Insight",
+            "description": desc_text or "No visual required.",
+            "metrics": [],
+            "primary_metric": None,
+            "sub_query_index": None,
+        }
+        graphs = [GraphItem(
+            type="summary_card",
+            graph_type="summary_card",
+            title="Insight",
+            summary=_to_json_safe(summary_payload),
+            insight=desc_text or "No visual required.",
+        )]
+    return GraphsResponse(transcript_id=transcript_id, chat_id=chat_id, graphs=graphs)
+
 
 
 @app.get(
@@ -1049,93 +1144,6 @@ async def query_dashboard_graphs(payload: DashboardGraphQueryRequest, http: Requ
     return response
 
 
-@app.post(
-    "/voice/sessions",
-    response_model=VoiceSessionStartResponse,
-    dependencies=[Depends(auth_required)],
-    tags=["Voice"],
-    summary="Start a voice session",
-    description="Initialise a voice-driven analytics session and return a session identifier.",
-)
-async def start_voice_session(http: Request = None):
-    user = _require_user(http)
-    user_id = user.get("id")
-    session = voice_agent.start_session(user_id)
-    user_doc = store.users.find_one({"user_id": user_id})
-    user_name = user_doc.get("name") if user_doc else None
-    greeting = f"Hello {user_name or 'there'}, I'm ready to help with your analytics."
-    audio_b64: Optional[str] = None
-    try:
-        audio_bytes = voice_output_adapter.synthesize(greeting)
-        if audio_bytes:
-            audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
-    except NotImplementedError:
-        audio_b64 = None
-    except Exception as synth_err:
-        logger.warning("Voice greeting synthesis failed: %s", synth_err)
-        audio_b64 = None
-    return VoiceSessionStartResponse(session_id=session.session_id, greeting=greeting, audio=audio_b64)
-
-
-@app.post(
-    "/voice/sessions/{session_id}/audio",
-    response_model=VoiceAudioChunkResponse,
-    dependencies=[Depends(auth_required)],
-    tags=["Voice"],
-    summary="Stream voice audio",
-    description="Send a chunk of base64-encoded PCM audio; receives spoken response when end-of-utterance is detected.",
-)
-async def stream_voice_audio(session_id: str, payload: VoiceAudioChunkRequest, http: Request = None):
-    user = _require_user(http)
-    user_id = user.get("id")
-    try:
-        session = voice_agent.get_session(session_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Voice session not found")
-    if session.user_id != user_id:
-        raise HTTPException(status_code=403, detail="Voice session does not belong to the current user")
-
-    try:
-        response_payload = voice_agent.ingest_audio(session_id, payload.audio, payload.end_of_utterance, payload.mime_type)
-    except ValueError as audio_err:
-        raise HTTPException(status_code=400, detail=str(audio_err))
-
-    if not response_payload:
-        return VoiceAudioChunkResponse(
-            type="listening",
-            message="Listening...",
-            transcript="",
-            audio="",
-        )
-
-    return VoiceAudioChunkResponse(
-        type=response_payload.get("type", "analytics"),
-        message=response_payload.get("message", ""),
-        transcript=response_payload.get("transcript", ""),
-        audio=response_payload.get("audio", ""),
-        payload=_to_json_safe(response_payload.get("payload")),
-    )
-
-
-@app.delete(
-    "/voice/sessions/{session_id}",
-    dependencies=[Depends(auth_required)],
-    tags=["Voice"],
-    summary="End a voice session",
-    description="Terminate a voice session and release buffered audio.",
-)
-async def end_voice_session(session_id: str, http: Request = None):
-    user = _require_user(http)
-    user_id = user.get("id")
-    try:
-        session = voice_agent.get_session(session_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Voice session not found")
-    if session.user_id != user_id:
-        raise HTTPException(status_code=403, detail="Voice session does not belong to the current user")
-    voice_agent.end_session(session_id)
-    return {"status": "ended", "session_id": session_id}
-
 @app.get(
     "/transcripts",
     dependencies=[Depends(auth_required)],
@@ -1212,7 +1220,7 @@ async def root():
             "GET /get_sql/{transcript_id}/{chat_id}": "Get generated SQL",
             "GET /get_tables/{transcript_id}/{chat_id}": "Get extracted table data",
             "GET /get_description/{transcript_id}/{chat_id}": "Get LLM description",
-            "GET /get_graph/{transcript_id}/{chat_id}": "Get graph HTML content",
+            "GET /get_graph/{transcript_id}/{chat_id}": "Get graph payload (Plotly JSON or summary data)",
             "GET /transcripts": "List transcripts",
             "POST /transcripts": "Create a new transcript",
             "GET /transcripts/{transcript_id}": "Get a transcript",
@@ -1424,14 +1432,9 @@ async def update_dashboard(payload: DashboardGraphsPayload, request: Request):
     def _sanitize_graph(doc: Dict[str, Any]) -> Dict[str, Any]:
         sanitized: Dict[str, Any] = {}
         for key, value in doc.items():
-            if key in {"html", "html_content", "svg", "static_html"} and isinstance(value, str):
-                trimmed = value[:20000]
-                sanitized["html"] = trimmed
-                sanitized["html_content"] = trimmed
-            elif key in {"data", "rows", "columns", "tables"}:
+            if key in {"data", "rows", "columns", "tables"}:
                 continue
-            else:
-                sanitized[key] = value
+            sanitized[key] = value
         if "id" not in sanitized:
             sanitized["id"] = doc.get("id") or f"graph_{uuid.uuid4().hex[:12]}"
         if isinstance(sanitized.get("query"), str):
@@ -1455,6 +1458,9 @@ async def update_dashboard(payload: DashboardGraphsPayload, request: Request):
             "data_source": graph_doc.get("data_source"),
             "description": graph_doc.get("insight") or graph_doc.get("description"),
             "metadata": graph_doc.get("metadata") or {},
+            "figure": graph_doc.get("figure"),
+            "config": graph_doc.get("config"),
+            "summary": graph_doc.get("summary"),
             "html_content": graph_doc.get("html") or graph_doc.get("html_content"),
             "active": True,
         }
@@ -1482,6 +1488,185 @@ async def update_dashboard(payload: DashboardGraphsPayload, request: Request):
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
     return {"graphs": graphs_payload}
+
+# -----------------
+# LiveKit session APIs
+# -----------------
+
+@app.post(
+    "/livekit/session",
+    dependencies=[Depends(auth_required)],
+    tags=["LiveKit"],
+    summary="Start LiveKit voice session",
+    response_model=LiveKitSessionStartResponse,
+)
+async def create_livekit_session(payload: LiveKitSessionCreateRequest, request: Request):
+    user = _require_user(request)
+    try:
+        session = await livekit_manager.create_session(
+            user_id=user["id"],
+            display_name=payload.display_name or user.get("name"),
+        )
+    except LiveKitConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    response = session.to_dict()
+    return response
+
+
+@app.delete(
+    "/livekit/session/{session_id}",
+    dependencies=[Depends(auth_required)],
+    tags=["LiveKit"],
+    summary="End LiveKit voice session",
+)
+async def end_livekit_session(session_id: str, request: Request):
+    user = _require_user(request)
+    try:
+        session = livekit_manager.get_session(session_id)
+    except LiveKitSessionNotFound:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.user_id != user.get("id"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    transcript_id = await livekit_manager.end_session(session_id)
+    return {"status": "terminated", "transcript_id": transcript_id}
+
+
+@app.post(
+    "/livekit/session/{session_id}/token",
+    dependencies=[Depends(auth_required)],
+    response_model=LiveKitTokenResponse,
+    tags=["LiveKit"],
+    summary="Issue LiveKit viewer token",
+)
+async def issue_livekit_token(
+    session_id: str,
+    request: Request,
+    payload: LiveKitTokenRequest | None = None,
+):
+    user = _require_user(request)
+    try:
+        session = livekit_manager.get_session(session_id)
+    except LiveKitSessionNotFound:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.user_id != user.get("id"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    display_name = payload.display_name if payload else None
+    try:
+        token, url, room_name, participant_identity, expires_at = livekit_manager.issue_viewer_token(
+            session_id=session_id,
+            user_id=user["id"],
+            display_name=display_name,
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return LiveKitTokenResponse(
+        session_id=session_id,
+        room_name=room_name,
+        participant_identity=participant_identity,
+        token=token,
+        url=url,
+        expires_at=expires_at,
+    )
+
+
+@app.post(
+    "/livekit/session/{session_id}/transcripts",
+    tags=["LiveKit"],
+    summary="Ingest transcript message from LiveKit agent",
+)
+async def ingest_livekit_transcript(
+    session_id: str,
+    payload: LiveKitTranscriptIngest,
+    request: Request,
+):
+    _require_agent(request)
+    try:
+        livekit_manager.get_session(session_id)
+    except LiveKitSessionNotFound:
+        raise HTTPException(status_code=404, detail="Session not found")
+    timestamp: Optional[datetime.datetime] = None
+    if payload.timestamp:
+        try:
+            ts = datetime.datetime.fromisoformat(payload.timestamp)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            timestamp = ts
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid timestamp format")
+    entry = await livekit_manager.append_transcript(
+        session_id=session_id,
+        role=payload.role,
+        text=payload.text.strip(),
+        timestamp=timestamp,
+        metadata=payload.metadata or {},
+    )
+    return {"status": "ok", "entry": entry.to_dict()}
+
+
+@app.post(
+    "/livekit/session/{session_id}/query",
+    tags=["LiveKit"],
+    summary="Execute database query for LiveKit agent",
+)
+async def livekit_query(
+    session_id: str,
+    payload: LiveKitQueryRequest,
+    request: Request,
+):
+    _require_agent(request)
+    question = (payload.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+    try:
+        livekit_manager.get_session(session_id)
+    except LiveKitSessionNotFound:
+        raise HTTPException(status_code=404, detail="Session not found")
+    context = payload.context or livekit_manager.build_conversation_context(session_id)
+    try:
+        result = await asyncio.to_thread(
+            processor.process_query_with_smart_visualization,
+            question,
+            context,
+        )
+    except Exception as exc:
+        logger.error("Failed to process LiveKit query: %s", exc)
+        raise HTTPException(status_code=500, detail="Query processing failed")
+    return {"result": _to_json_safe(result)}
+
+ 
+
+@app.websocket("/livekit/session/{session_id}/stream")
+async def livekit_transcript_stream(websocket: WebSocket, session_id: str):
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4401, reason="Missing token")
+        return
+    payload = verify_token(token)
+    if not payload:
+        await websocket.close(code=4401, reason="Invalid token")
+        return
+    user_id = payload.get("sub")
+    try:
+        session = livekit_manager.get_session(session_id)
+    except LiveKitSessionNotFound:
+        await websocket.close(code=4404, reason="Session not found")
+        return
+    if session.user_id != user_id:
+        await websocket.close(code=4403, reason="Forbidden")
+        return
+    try:
+        await livekit_manager.register_websocket(session_id, websocket)
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        await livekit_manager.unregister_websocket(session_id, websocket)
+    except Exception as exc:
+        logger.warning("LiveKit websocket error for session %s: %s", session_id, exc)
+        await livekit_manager.unregister_websocket(session_id, websocket)
+        try:
+            await websocket.close(code=1011, reason="Internal error")
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     import uvicorn

@@ -31,6 +31,7 @@ import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+from plotly.utils import PlotlyJSONEncoder
 
 if TYPE_CHECKING:
     from mongo_store import MongoChatStore
@@ -112,6 +113,9 @@ class DashboardGraphMetadata:
     data_source: Optional[str] = None
     data: List[Dict[str, Any]] = field(default_factory=list)
     description: Optional[str] = None
+    figure: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None
+    summary: Optional[Dict[str, Any]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     active: bool = True
     row_count: int = 0
@@ -127,6 +131,9 @@ class DashboardGraphMetadata:
             "data_source": self.data_source,
             "data": self.data,
             "description": self.description,
+            "figure": self.figure,
+            "config": self.config,
+            "summary": self.summary,
             "metadata": self.metadata,
             "active": self.active,
             "row_count": self.row_count,
@@ -145,6 +152,9 @@ class DashboardGraphMetadata:
             "data_source": self.data_source,
             "data": self.data,
             "description": self.description,
+            "figure": self.figure,
+            "config": self.config,
+            "summary": self.summary,
             "metadata": self.metadata,
             "active": self.active,
             "row_count": self.row_count,
@@ -380,6 +390,9 @@ class DashboardQueryEngine:
             data_source=doc.get("data_source"),
             data=data,
             description=doc.get("description"),
+            figure=doc.get("figure"),
+            config=doc.get("config"),
+            summary=doc.get("summary"),
             metadata=metadata,
             active=bool(doc.get("active", True)),
             row_count=row_count,
@@ -744,6 +757,169 @@ class SmartGraphGenerator:
             os.makedirs(self.output_dir)
             logger.info(f"Created output directory: {self.output_dir}")
 
+    def _figure_to_json(self, fig: go.Figure) -> Dict[str, Any]:
+        """Convert a Plotly figure into a JSON-safe dictionary."""
+        try:
+            return json.loads(json.dumps(fig, cls=PlotlyJSONEncoder))
+        except Exception as exc:
+            logger.warning(f"Failed to encode figure with PlotlyJSONEncoder: {exc}")
+            try:
+                return fig.to_dict()
+            except Exception as inner_exc:
+                logger.error(f"Failed to convert figure to dict: {inner_exc}")
+                return {}
+
+    @staticmethod
+    def _default_plotly_config() -> Dict[str, Any]:
+        """Shared Plotly config to keep charts responsive in the UI."""
+        return {
+            "responsive": True,
+            "displaylogo": False,
+            "modeBarButtonsToRemove": ["toImage"],
+        }
+
+    def _build_plotly_payload(
+        self,
+        fig: go.Figure,
+        chart_type: str,
+        title: str,
+        query: str,
+        sub_query_index: Optional[int],
+    ) -> Dict[str, Any]:
+        """Normalize the Plotly figure into the structure expected by finalapi.py."""
+        payload: Dict[str, Any] = {
+            "type": "plotly",
+            "graph_type": chart_type,
+            "title": title,
+            "figure": self._figure_to_json(fig),
+            "config": self._default_plotly_config(),
+            "query": query,
+            "sub_query_index": sub_query_index,
+        }
+        try:
+            payload["html"] = fig.to_html(full_html=False, include_plotlyjs="cdn")
+        except Exception:
+            # HTML is optional; ignore failures to avoid breaking chart generation.
+            pass
+        return payload
+
+    @staticmethod
+    def _format_metric_value(label: str, value: Any) -> Tuple[Any, str]:
+        """Return the raw numeric value (if applicable) and a friendly formatted string."""
+        raw_value = value
+        if isinstance(value, Decimal):
+            raw_value = float(value)
+        if isinstance(raw_value, (int, float)):
+            if abs(raw_value) >= 1000:
+                formatted = f"{raw_value:,.2f}"
+            else:
+                formatted = f"{raw_value:.2f}"
+            if any(keyword in label.lower() for keyword in ["amount", "revenue", "sale", "cost", "price", "profit", "total"]):
+                formatted = f"₹{formatted}"
+            return raw_value, formatted
+        return value, str(value)
+
+    def _render_summary_card_html(
+        self,
+        query: str,
+        metrics: List[Dict[str, Any]],
+        sub_query_index: Optional[int],
+    ) -> Optional[str]:
+        """Render a lightweight HTML snippet for value cards (optional fallback)."""
+        try:
+            badge = f"<div class='sub-query-badge'>Query {sub_query_index}</div>" if sub_query_index else ""
+            metric_blocks = "\n".join(
+                f"""
+                <div class="value-item">
+                    <div class="value-label">{metric['label']}</div>
+                    <div class="value-number">{metric['formatted']}</div>
+                </div>
+                """
+                for metric in metrics
+            )
+            html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Summary Card</title>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f7fb;
+            margin: 0;
+            padding: 24px;
+        }}
+        .container {{
+            background: white;
+            border-radius: 16px;
+            padding: 32px;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+            max-width: 520px;
+            margin: 0 auto;
+        }}
+        .sub-query-badge {{
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: #4f46e5;
+            background: rgba(79,70,229,0.12);
+            display: inline-block;
+            padding: 6px 14px;
+            border-radius: 999px;
+            margin-bottom: 12px;
+        }}
+        .query-text {{
+            font-size: 18px;
+            font-weight: 500;
+            color: #1f2937;
+            margin-bottom: 24px;
+        }}
+        .values-grid {{
+            display: grid;
+            gap: 16px;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        }}
+        .value-item {{
+            background: #f9fafc;
+            border-radius: 12px;
+            padding: 16px;
+        }}
+        .value-label {{
+            font-size: 13px;
+            font-weight: 600;
+            color: #6b7280;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }}
+        .value-number {{
+            font-size: 28px;
+            font-weight: 600;
+            color: #111827;
+        }}
+        .timestamp {{
+            font-size: 12px;
+            color: #9ca3af;
+            margin-top: 24px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        {badge}
+        <div class="query-text">{query}</div>
+        <div class="values-grid">
+            {metric_blocks}
+        </div>
+        <div class="timestamp">Generated on {datetime.now().strftime('%B %d, %Y at %I:%M %p')}</div>
+    </div>
+</body>
+</html>"""
+            return html
+        except Exception as exc:
+            logger.debug(f"Failed to render summary card HTML: {exc}")
+            return None
+
     @staticmethod
     def _build_chart_title(query: str, sub_query_index: Optional[int] = None) -> str:
         """Generate a concise chart title without duplicating the query text."""
@@ -785,238 +961,46 @@ class SmartGraphGenerator:
 
         return df_converted
 
-    def create_html_value_card(self, data: List[Dict], query: str, sub_query_index: int = None) -> Optional[str]:
-        """Create HTML value card for single value results with sub-query support"""
-        try:
-            logger.info(f"\n=== CREATING HTML VALUE CARD ===")
-            if not data or len(data) == 0:
-                return None
-
-            # Handle single value case
-            if len(data) == 1 and len(data[0]) == 1:
-                key = list(data[0].keys())[0]
-                value = data[0][key]
-
-                # Format the value
-                if isinstance(value, (int, float, Decimal)):
-                    if value >= 1000:
-                        formatted_value = f"₹{value:,.2f}" if 'amount' in key.lower() or 'total' in key.lower() or 'revenue' in key.lower() or 'sales' in key.lower() else f"{value:,.0f}"
-                    else:
-                        formatted_value = f"₹{value:.2f}" if 'amount' in key.lower() or 'total' in key.lower() or 'revenue' in key.lower() or 'sales' in key.lower() else f"{value:.1f}"
-                else:
-                    formatted_value = str(value)
-
-                # Create HTML content
-                html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>Query Result</title>
-    <style>
-        body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            margin: 0;
-            padding: 20px;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-        }}
-        .value-card {{
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-            text-align: center;
-            max-width: 500px;
-            width: 100%;
-            transform: translateY(0);
-            transition: transform 0.3s ease;
-        }}
-        .value-card:hover {{
-            transform: translateY(-5px);
-            box-shadow: 0 25px 50px rgba(0,0,0,0.15);
-        }}
-        .query-text {{
-            font-size: 18px;
-            color: #666;
-            margin-bottom: 20px;
-            font-weight: 400;
-            line-height: 1.4;
-        }}
-        .label {{
-            font-size: 20px;
-            color: #888;
-            margin-bottom: 15px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            font-weight: 600;
-        }}
-        .value {{
-            font-size: 48px;
-            color: #2c3e50;
-            font-weight: 700;
-            margin: 20px 0;
-            text-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }}
-        .timestamp {{
-            font-size: 14px;
-            color: #aaa;
-            margin-top: 25px;
-            font-style: italic;
-        }}
-        .sub-query-badge {{
-            background: #667eea;
-            color: white;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-size: 12px;
-            margin-bottom: 20px;
-            display: inline-block;
-            font-weight: 600;
-        }}
-    </style>
-</head>
-<body>
-    <div class="value-card">
-        {f'<div class="sub-query-badge">Query {sub_query_index}</div>' if sub_query_index else ''}
-        <div class="query-text">{query[:80] + '...' if len(query) > 80 else query}</div>
-        <div class="label">{key.replace('_', ' ').title()}</div>
-        <div class="value">{formatted_value}</div>
-        <div class="timestamp">Generated on {datetime.now().strftime('%B %d, %Y at %I:%M %p')}</div>
-    </div>
-</body>
-</html>"""
-
-                # Save HTML file
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                suffix = f"_subquery{sub_query_index}" if sub_query_index else ""
-                filename = f"{self.output_dir}/value_card_{timestamp}{suffix}.html"
-
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(html_content)
-
-                logger.info(f"✅ HTML value card created: {filename}")
-                return filename
-
-            # Handle multiple values in single row
-            elif len(data) == 1 and len(data[0]) > 1:
-                html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>Query Results</title>
-    <style>
-        body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            margin: 0;
-            padding: 20px;
-            min-height: 100vh;
-        }}
-        .container {{
-            max-width: 800px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-        }}
-        .query-text {{
-            font-size: 20px;
-            color: #666;
-            margin-bottom: 30px;
-            text-align: center;
-            line-height: 1.4;
-        }}
-        .values-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin: 20px 0;
-        }}
-        .value-item {{
-            background: #f8f9fa;
-            padding: 25px;
-            border-radius: 15px;
-            text-align: center;
-            border-left: 4px solid #667eea;
-        }}
-        .value-label {{
-            font-size: 14px;
-            color: #888;
-            margin-bottom: 10px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            font-weight: 600;
-        }}
-        .value-number {{
-            font-size: 28px;
-            color: #2c3e50;
-            font-weight: 700;
-        }}
-        .timestamp {{
-            text-align: center;
-            font-size: 14px;
-            color: #aaa;
-            margin-top: 30px;
-            font-style: italic;
-        }}
-        .sub-query-badge {{
-            background: #667eea;
-            color: white;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-size: 12px;
-            margin-bottom: 20px;
-            display: inline-block;
-            font-weight: 600;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        {f'<div style="text-align: center;"><div class="sub-query-badge">Query {sub_query_index}</div></div>' if sub_query_index else ''}
-        <div class="query-text">{query}</div>
-        <div class="values-grid">"""
-
-                # Handle multiple values in single row
-                for key, value in data[0].items():
-                    if isinstance(value, (int, float, Decimal)):
-                        if value >= 1000:
-                            formatted_value = f"₹{value:,.2f}" if any(word in key.lower() for word in ['amount', 'total', 'revenue', 'sales', 'cost', 'price']) else f"{value:,.0f}"
-                        else:
-                            formatted_value = f"₹{value:.2f}" if any(word in key.lower() for word in ['amount', 'total', 'revenue', 'sales', 'cost', 'price']) else f"{value:.1f}"
-                    else:
-                        formatted_value = str(value)
-
-                    html_content += f"""
-            <div class="value-item">
-                <div class="value-label">{key.replace('_', ' ').title()}</div>
-                <div class="value-number">{formatted_value}</div>
-            </div>"""
-
-                html_content += f"""
-        </div>
-        <div class="timestamp">Generated on {datetime.now().strftime('%B %d, %Y at %I:%M %p')}</div>
-    </div>
-</body>
-</html>"""
-
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                suffix = f"_subquery{sub_query_index}" if sub_query_index else ""
-                filename = f"{self.output_dir}/summary_card_{timestamp}{suffix}.html"
-
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(html_content)
-
-                logger.info(f"✅ HTML summary card created: {filename}")
-                return filename
-
+    def create_html_value_card(self, data: List[Dict], query: str, sub_query_index: int = None) -> Optional[Dict[str, Any]]:
+        """Create a summary card payload (with optional HTML) for simple metric outputs."""
+        if not data or not isinstance(data[0], dict):
             return None
 
-        except Exception as e:
-            logger.error(f"❌ Error creating HTML value card: {e}")
+        title = self._build_chart_title(query, sub_query_index)
+        metrics: List[Dict[str, Any]] = []
+
+        for key, value in data[0].items():
+            numeric_value, formatted_value = self._format_metric_value(key, value)
+            metrics.append({
+                "label": key.replace("_", " ").title(),
+                "value": numeric_value,
+                "formatted": formatted_value,
+            })
+
+        if not metrics:
             return None
+
+        html_content = self._render_summary_card_html(query, metrics, sub_query_index)
+        summary_payload = {
+            "type": "summary_card",
+            "title": title,
+            "description": query,
+            "metrics": metrics,
+            "primary_metric": metrics[0],
+            "sub_query_index": sub_query_index,
+        }
+
+        return {
+            "type": "summary_card",
+            "graph_type": "summary_card",
+            "title": title,
+            "figure": None,
+            "config": None,
+            "summary": summary_payload,
+            "html": html_content,
+            "query": query,
+            "sub_query_index": sub_query_index,
+        }
 
     def analyze_data_for_visualization(self, data: List[Dict]) -> Dict[str, Any]:
         """Analyze data structure to determine visualization suitability"""
@@ -1247,7 +1231,7 @@ RESPOND ONLY WITH VALID JSON (no markdown, no code blocks, no extra text):
             logger.error(f"❌ Error getting graph type from LLM: {e}")
             return {"graph_type": None, "error": str(e)}
 
-    def fallback_visualization_logic(self, data: List[Dict], query: str, sub_query_index: int = None) -> Optional[str]:
+    def fallback_visualization_logic(self, data: List[Dict], query: str, sub_query_index: int = None) -> Optional[Dict[str, Any]]:
         """CORRECTED fallback logic - creates HTML cards when visualization is not suitable"""
         logger.info("🔄 Using fallback visualization logic")
 
@@ -1269,17 +1253,17 @@ RESPOND ONLY WITH VALID JSON (no markdown, no code blocks, no extra text):
 
             if len(date_cols) > 0 and len(numeric_cols) > 0:
                 logger.info("🔄 Fallback: Creating line chart (time series)")
-                return self.create_line_chart(df_converted, date_cols[0], numeric_cols[0], None, title, sub_query_index)
+                return self.create_line_chart(df_converted, date_cols[0], numeric_cols[0], None, title, query, sub_query_index)
             elif len(categorical_cols) > 0 and len(numeric_cols) > 0:
                 if len(df_converted[categorical_cols[0]].unique()) <= 8 and any(word in query.lower() for word in ['share', 'proportion', 'percentage', 'distribution']):
                     logger.info("🔄 Fallback: Creating pie chart")
-                    return self.create_pie_chart(df_converted, categorical_cols[0], numeric_cols[0], title, sub_query_index)
+                    return self.create_pie_chart(df_converted, categorical_cols[0], numeric_cols[0], title, query, sub_query_index)
                 else:
                     logger.info("🔄 Fallback: Creating bar chart")
-                    return self.create_bar_chart(df_converted, categorical_cols[0], numeric_cols[0], None, title, sub_query_index)
+                    return self.create_bar_chart(df_converted, categorical_cols[0], numeric_cols[0], None, title, query, sub_query_index)
             elif len(numeric_cols) >= 2:
                 logger.info("🔄 Fallback: Creating scatter plot")
-                return self.create_scatter_plot(df_converted, numeric_cols[0], numeric_cols[1], None, title, sub_query_index)
+                return self.create_scatter_plot(df_converted, numeric_cols[0], numeric_cols[1], None, title, query, sub_query_index)
             else:
                 logger.info("🔄 No chart suitable - creating HTML value card as final fallback")
                 return self.create_html_value_card(data, query, sub_query_index)
@@ -1292,14 +1276,21 @@ RESPOND ONLY WITH VALID JSON (no markdown, no code blocks, no extra text):
             except:
                 return None
 
-    def create_bar_chart(self, df: pd.DataFrame, x_col: str, y_col: str, group_col: Optional[str], title: str, sub_query_index: int = None) -> Optional[str]:
-        """Create bar chart with sub-query support"""
+    def create_bar_chart(self, df: pd.DataFrame, x_col: str, y_col: str, group_col: Optional[str], title: str, query: str, sub_query_index: int = None) -> Optional[Dict[str, Any]]:
+        """Create bar chart with sub-query support and return JSON-ready payload."""
         try:
             logger.info(f"📊 Creating bar chart: X={x_col}, Y={y_col}, Group={group_col}")
 
             if group_col and group_col in df.columns:
-                fig = px.bar(df, x=x_col, y=y_col, color=group_col, title=title,
-                           barmode='group', text_auto=True)
+                fig = px.bar(
+                    df,
+                    x=x_col,
+                    y=y_col,
+                    color=group_col,
+                    title=title,
+                    barmode='group',
+                    text_auto=True,
+                )
                 chart_type = "groupedbarchart"
             else:
                 fig = px.bar(df, x=x_col, y=y_col, title=title, text_auto=True)
@@ -1310,23 +1301,17 @@ RESPOND ONLY WITH VALID JSON (no markdown, no code blocks, no extra text):
                 title_font_size=16,
                 xaxis_title=x_col.replace('_', ' ').title(),
                 yaxis_title=y_col.replace('_', ' ').title(),
-                showlegend=True if group_col else False
+                showlegend=bool(group_col),
             )
 
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            suffix = f"_subquery{sub_query_index}" if sub_query_index else ""
-            filename = f"{self.output_dir}/{chart_type}_{timestamp}{suffix}.html"
-            fig.write_html(filename)
+            return self._build_plotly_payload(fig, chart_type, title, query, sub_query_index)
 
-            logger.info(f"✅ Bar chart created: {filename}")
-            return filename
-
-        except Exception as e:
-            logger.error(f"❌ Error creating bar chart: {e}")
+        except Exception as exc:
+            logger.error(f"❌ Error creating bar chart: {exc}")
             return None
 
-    def create_line_chart(self, df: pd.DataFrame, x_col: str, y_col: str, group_col: Optional[str], title: str, sub_query_index: int = None) -> Optional[str]:
-        """Create line chart with sub-query support"""
+    def create_line_chart(self, df: pd.DataFrame, x_col: str, y_col: str, group_col: Optional[str], title: str, query: str, sub_query_index: int = None) -> Optional[Dict[str, Any]]:
+        """Create line chart with sub-query support and return JSON-ready payload."""
         try:
             logger.info(f"📊 Creating line chart: X={x_col}, Y={y_col}, Group={group_col}")
 
@@ -1340,25 +1325,18 @@ RESPOND ONLY WITH VALID JSON (no markdown, no code blocks, no extra text):
                 title_font_size=16,
                 xaxis_title=x_col.replace('_', ' ').title(),
                 yaxis_title=y_col.replace('_', ' ').title(),
-                showlegend=True if group_col else False
+                showlegend=bool(group_col),
             )
 
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            suffix = f"_subquery{sub_query_index}" if sub_query_index else ""
-            filename = f"{self.output_dir}/linechart_{timestamp}{suffix}.html"
-            fig.write_html(filename)
+            return self._build_plotly_payload(fig, 'linechart', title, query, sub_query_index)
 
-            logger.info(f"✅ Line chart created: {filename}")
-            return filename
-
-        except Exception as e:
-            logger.error(f"❌ Error creating line chart: {e}")
+        except Exception as exc:
+            logger.error(f"❌ Error creating line chart: {exc}")
             return None
 
-    def create_pie_chart(self, df: pd.DataFrame, names_col: str, values_col: str, title: str, sub_query_index: int = None) -> Optional[str]:
-        """Create pie chart with sub-query support"""
+    def create_pie_chart(self, df: pd.DataFrame, names_col: str, values_col: str, title: str, query: str, sub_query_index: int = None) -> Optional[Dict[str, Any]]:
+        """Create pie chart with sub-query support and return JSON-ready payload."""
         try:
-            # logger.info("The")
             logger.info(f"📊 Creating pie chart: Names={names_col}, Values={values_col}")
 
             if len(df) > df[names_col].nunique():
@@ -1367,27 +1345,16 @@ RESPOND ONLY WITH VALID JSON (no markdown, no code blocks, no extra text):
                 df_agg = df
 
             fig = px.pie(df_agg, names=names_col, values=values_col, title=title)
+            fig.update_layout(font=dict(size=12), title_font_size=16, showlegend=True)
 
-            fig.update_layout(
-                font=dict(size=12),
-                title_font_size=16,
-                showlegend=True
-            )
+            return self._build_plotly_payload(fig, 'piechart', title, query, sub_query_index)
 
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            suffix = f"_subquery{sub_query_index}" if sub_query_index else ""
-            filename = f"{self.output_dir}/piechart_{timestamp}{suffix}.html"
-            fig.write_html(filename)
-
-            logger.info(f"✅ Pie chart created: {filename}")
-            return filename
-
-        except Exception as e:
-            logger.error(f"❌ Error creating pie chart: {e}")
+        except Exception as exc:
+            logger.error(f"❌ Error creating pie chart: {exc}")
             return None
 
-    def create_scatter_plot(self, df: pd.DataFrame, x_col: str, y_col: str, group_col: Optional[str], title: str, sub_query_index: int = None) -> Optional[str]:
-        """Create scatter plot with sub-query support"""
+    def create_scatter_plot(self, df: pd.DataFrame, x_col: str, y_col: str, group_col: Optional[str], title: str, query: str, sub_query_index: int = None) -> Optional[Dict[str, Any]]:
+        """Create scatter plot with sub-query support and return JSON-ready payload."""
         try:
             logger.info(f"📊 Creating scatter plot: X={x_col}, Y={y_col}, Group={group_col}")
 
@@ -1401,22 +1368,16 @@ RESPOND ONLY WITH VALID JSON (no markdown, no code blocks, no extra text):
                 title_font_size=16,
                 xaxis_title=x_col.replace('_', ' ').title(),
                 yaxis_title=y_col.replace('_', ' ').title(),
-                showlegend=True if group_col else False
+                showlegend=bool(group_col),
             )
 
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            suffix = f"_subquery{sub_query_index}" if sub_query_index else ""
-            filename = f"{self.output_dir}/scatterplot_{timestamp}{suffix}.html"
-            fig.write_html(filename)
+            return self._build_plotly_payload(fig, 'scatterplot', title, query, sub_query_index)
 
-            logger.info(f"✅ Scatter plot created: {filename}")
-            return filename
-
-        except Exception as e:
-            logger.error(f"❌ Error creating scatter plot: {e}")
+        except Exception as exc:
+            logger.error(f"❌ Error creating scatter plot: {exc}")
             return None
 
-    def generate_smart_visualization(self, data: List[Dict], query: str, user_query: str, model_name: str, sub_query_index: int = None) -> Optional[str]:
+    def generate_smart_visualization(self, data: List[Dict], query: str, user_query: str, model_name: str, sub_query_index: int = None) -> Optional[Dict[str, Any]]:
         """Generate smart visualization with LLM guidance and CORRECTED fallback logic"""
         logger.info(f"🎨 Generating smart visualization for query: {query[:50]}{'...' if len(query) > 50 else query}")
 
@@ -1449,15 +1410,15 @@ RESPOND ONLY WITH VALID JSON (no markdown, no code blocks, no extra text):
 
             try:
                 if graph_type == "barchart":
-                    return self.create_bar_chart(df_converted, x_col, y_col, group_col, title, sub_query_index)
+                    return self.create_bar_chart(df_converted, x_col, y_col, group_col, title, query, sub_query_index)
                 elif graph_type == "groupedbarchart":
-                    return self.create_bar_chart(df_converted, x_col, y_col, group_col, title, sub_query_index)
+                    return self.create_bar_chart(df_converted, x_col, y_col, group_col, title, query, sub_query_index)
                 elif graph_type == "linechart":
-                    return self.create_line_chart(df_converted, x_col, y_col, group_col, title, sub_query_index)
+                    return self.create_line_chart(df_converted, x_col, y_col, group_col, title, query, sub_query_index)
                 elif graph_type == "piechart":
-                    return self.create_pie_chart(df_converted, x_col, y_col, title, sub_query_index)
+                    return self.create_pie_chart(df_converted, x_col, y_col, title, query, sub_query_index)
                 elif graph_type == "scatterplot":
-                    return self.create_scatter_plot(df_converted, x_col, y_col, group_col, title, sub_query_index)
+                    return self.create_scatter_plot(df_converted, x_col, y_col, group_col, title, query, sub_query_index)
                 else:
                     logger.warning(f"Unknown graph type: {graph_type}, using fallback")
                     return self.fallback_visualization_logic(data, query, sub_query_index)
@@ -1964,7 +1925,7 @@ You are a professional business data analyst. Based on the provided sales data, 
                     "sub_query": sub_queries[i-1] if i-1 < len(sub_queries) else f"Sub-query {i}",
                     "record_count": len(result['execution_results']),
                     "sample_data": result['execution_results'][:2] if result['execution_results'] else [],
-                    "has_visualization": bool(result.get('graph_file'))
+                    "has_visualization": bool(result.get('visualization') or (result.get('visualizations') or []))
                 })
 
         prompt = f"""Provide a detailed, informative description (around 10 lines) that includes key findings and insights from the data, business implications and trends, specific numbers and percentages where relevant, recommendations or observations for business decision-making, all written in clear, professional English suitable for business executives. The tone should be professional yet conversational, focusing on actionable insights that can drive business decisions, ensuring language is grammatically correct and business-friendly. The analysis should be presented in paragraph format within 120 words, without bullet points. The context is aligned with the Indian market, so monetary values must be presented in INR (₹) with proper formatting.
@@ -2221,7 +2182,8 @@ class SmartNL2SQLProcessor:
             "sql_query": "",
             "execution_results": [],
             "description": "",
-            "graph_file": None,
+            "visualization": None,
+            "visualizations": [],
             "graph_type": None,
             "error": None,
             "warning": None,
@@ -2335,13 +2297,24 @@ class SmartNL2SQLProcessor:
             # Step 6: Generate visualization (CORRECTED - will create HTML cards when appropriate)
             logger.info(f"🔍 STEP 6: Generating smart visualization...")
             if execution_results:
-                graph_file = self.graph_generator.generate_smart_visualization(
-                    execution_results, natural_language_query, natural_language_query, 
-                    self.config.model_name, sub_query_index
+                graph_payload = self.graph_generator.generate_smart_visualization(
+                    execution_results,
+                    natural_language_query,
+                    natural_language_query,
+                    self.config.model_name,
+                    sub_query_index,
                 )
-                if graph_file:
-                    result["graph_file"] = graph_file
-                    result["graph_type"] = self.determine_display_type_from_filename(graph_file)
+                if graph_payload:
+                    result["visualization"] = graph_payload
+                    graph_type = graph_payload.get("graph_type") or graph_payload.get("type")
+                    result["visualizations"] = [{
+                        "payload": graph_payload,
+                        "sub_query_index": sub_query_index,
+                        "sub_query": natural_language_query,
+                        "graph_type": graph_type,
+                        "title": graph_payload.get("title"),
+                    }]
+                    result["graph_type"] = graph_type
                     logger.info(f"✅ Visualization generated: {result['graph_type']}")
                 else:
                     logger.info("ℹ️  No visualization generated")
@@ -2475,7 +2448,8 @@ class SmartNL2SQLProcessor:
             "sql_query": "",
             "execution_results": [],
             "description": description,
-            "graph_file": None,
+            "visualization": None,
+            "visualizations": [],
             "graph_type": None,
             "error": None,
             "warning": None,
@@ -2493,7 +2467,6 @@ class SmartNL2SQLProcessor:
             "sub_queries": [],
             "sub_results": [],
             "combined_description": None,
-            "visualizations": [],
             "dashboard_action": action,
             "dashboard_target": target,
             "dashboard_reasoning": reasoning,
@@ -2528,12 +2501,25 @@ class SmartNL2SQLProcessor:
         # Collect all visualizations
         visualizations = []
         for result in successful_results:
-            if result.get('graph_file'):
+            entries = result.get('visualizations') or []
+            if isinstance(entries, dict):
+                entries = [entries]
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                payload = entry.get('payload')
+                if not isinstance(payload, dict):
+                    continue
+                sub_idx = entry.get('sub_query_index') or result.get('sub_query_index')
+                base_query = entry.get('sub_query') or ''
+                if not base_query and sub_idx and 1 <= sub_idx <= len(sub_queries):
+                    base_query = sub_queries[sub_idx - 1]
                 visualizations.append({
-                    "sub_query_index": result.get('sub_query_index'),
-                    "sub_query": sub_queries[result.get('sub_query_index', 1) - 1] if result.get('sub_query_index') else "",
-                    "graph_file": result['graph_file'],
-                    "graph_type": result.get('graph_type', 'Visualization')
+                    "sub_query_index": sub_idx,
+                    "sub_query": base_query,
+                    "payload": payload,
+                    "graph_type": payload.get("graph_type") or payload.get("type"),
+                    "title": payload.get("title"),
                 })
 
         # Create comprehensive multi-query result
@@ -2568,26 +2554,6 @@ class SmartNL2SQLProcessor:
 
         return multi_result
 
-    def determine_display_type_from_filename(self, filename: str) -> str:
-        """Extract display type from filename"""
-        if "value_card" in filename:
-            return "Value Card"
-        elif "summary_card" in filename:
-            return "Summary Card"
-        elif "linechart" in filename:
-            return "Line Chart"  
-        elif "groupedbarchart" in filename:
-            return "Grouped Bar Chart"
-        elif "barchart" in filename:
-            return "Bar Chart"
-        elif "piechart" in filename:
-            return "Pie Chart"
-        elif "scatterplot" in filename:
-            return "Scatter Plot"
-        elif "histogram" in filename:
-            return "Histogram"
-        else:
-            return "Data Visualization"
 
 def main():
     """Main function with enhanced test queries including multi-query support and corrected functionality"""
@@ -2623,7 +2589,14 @@ def main():
             logger.info(f"   Visualizations generated: {len(result['visualizations'])}")
 
             for viz in result['visualizations']:
-                logger.info(f"   📈 {viz['graph_type']}: {viz['graph_file']}")
+                payload = viz.get('payload') if isinstance(viz, dict) else None
+                graph_label = ''
+                if isinstance(payload, dict):
+                    graph_label = payload.get('graph_type') or payload.get('type') or ''
+                title_label = ''
+                if isinstance(payload, dict):
+                    title_label = payload.get('title') or viz.get('sub_query') or ''
+                logger.info(f"   📈 {graph_label or 'Visualization'}: {title_label or 'Payload stored'}")
 
             logger.info(f"📝 COMBINED DESCRIPTION:")
             logger.info(f"   {result['combined_description']}")
@@ -2650,11 +2623,12 @@ def main():
                 if result.get("retry_attempts", 0) > 0:
                     logger.info(f"🔄 Required {result['retry_attempts']} retries before success")
 
-                if result.get("graph_file"):
-                    logger.info(f"📊 VISUALIZATION GENERATED: {result['graph_file']}")
-                    logger.info(f"   Display Type: {result['graph_type']}")
+                visualization_payload = result.get("visualization") if isinstance(result.get("visualization"), dict) else None
+                if visualization_payload:
+                    logger.info(f"📊 VISUALIZATION GENERATED: {visualization_payload.get('graph_type') or visualization_payload.get('type')}")
+                    logger.info(f"   Title: {visualization_payload.get('title')}")
                 else:
-                    logger.info(f"ℹ️  NO VISUALIZATION GENERATED")
+                    logger.info("ℹ️  NO VISUALIZATION GENERATED")
 
         logger.info(f"⏱️  Processing time: {result.get('processing_time_seconds', 0):.2f} seconds")
 
@@ -2664,7 +2638,11 @@ def main():
     blocked_queries = [r for r in all_results if r.get("warning")]
     failed_queries = [r for r in all_results if r.get("error") and r.get("is_relevant", True)]
     retry_queries = [r for r in all_results if r.get("retry_attempts", 0) > 0]
-    visualizations_generated = [r for r in all_results if r.get("graph_file") or (r.get("visualizations") and len(r.get("visualizations", [])) > 0)]
+    visualizations_generated = [
+        r for r in all_results
+        if isinstance(r.get("visualization"), dict)
+        or (r.get("visualizations") and len(r.get("visualizations") or []) > 0)
+    ]
 
     logger.info(f"{'='*80}")
     logger.info("📊 COMPREHENSIVE RESULTS SUMMARY")

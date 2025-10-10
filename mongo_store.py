@@ -1,15 +1,21 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from datetime import datetime, date, time, timezone
 import uuid
 import re
+import json
+import logging
+from pathlib import Path
 
 from pymongo import MongoClient, ReturnDocument
 from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
 from decimal import Decimal
 from bson.decimal128 import Decimal128
+import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -47,14 +53,39 @@ class MongoChatStore:
           ]
     """
 
-    def __init__(self, uri: str = "mongodb://localhost:27017", db_name: str = "analytics_chat") -> None:
+    def __init__(
+        self,
+        uri: str = "mongodb://localhost:27017",
+        db_name: str = "analytics_chat",
+        graph_storage_dir: Optional[Union[str, Path]] = None,
+    ) -> None:
         self.client = MongoClient(uri)
         self.db = self.client[db_name]
         self.col: Collection = self.db["transcripts"]
         self.users: Collection = self.db["users"]
         self.graphs: Collection = self.db["dashboard_graphs"]
+        self.livekit_sessions: Collection = self.db["livekit_sessions"]
+        self.graph_storage_dir = self._resolve_graph_storage_dir(graph_storage_dir)
         self._ensure_indexes()
         self._ensure_graph_indexes()
+        self._ensure_livekit_indexes()
+
+    def _resolve_graph_storage_dir(self, path_hint: Optional[Union[str, Path]]) -> Optional[Path]:
+        target: Path
+        try:
+            target = Path(path_hint).expanduser() if path_hint is not None else Path(__file__).resolve().parent / "graphs"
+        except Exception as exc:
+            logger.warning("Invalid graph storage path %s: %s", path_hint, exc)
+            return None
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning("Unable to create graph storage directory %s: %s", target, exc)
+            return None
+        try:
+            return target.resolve()
+        except Exception:
+            return target
 
     def _ensure_indexes(self) -> None:
         self.col.create_index("transcript_id", unique=True)
@@ -93,6 +124,16 @@ class MongoChatStore:
                     self.users.update_one({"_id": doc["_id"]}, {"$set": {"username": fallback}})
         except Exception:
             # Swallow to avoid failing app startup; registration will still set the field going forward.
+            pass
+
+    def _ensure_livekit_indexes(self) -> None:
+        try:
+            self.livekit_sessions.create_index("session_id", unique=True)
+        except Exception:
+            pass
+        try:
+            self.livekit_sessions.create_index("user_id")
+        except Exception:
             pass
 
     def _ensure_graph_indexes(self) -> None:
@@ -153,6 +194,20 @@ class MongoChatStore:
             ]}
         cur = self.col.find(query, projection).sort("updated_at", -1).limit(limit)
         return list(cur)
+
+    # LiveKit session persistence -------------------------------------------------
+    def upsert_livekit_session(self, doc: Dict[str, Any]) -> None:
+        payload = self._to_bson_safe(doc)
+        self.livekit_sessions.update_one({"session_id": doc["session_id"]}, {"$set": payload}, upsert=True)
+
+    def get_livekit_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        return self.livekit_sessions.find_one({"session_id": session_id}, {"_id": 0})
+
+    def set_livekit_session_active(self, session_id: str, active: bool) -> None:
+        self.livekit_sessions.update_one({"session_id": session_id}, {"$set": {"active": active}})
+
+    def delete_livekit_session(self, session_id: str) -> None:
+        self.livekit_sessions.delete_one({"session_id": session_id})
 
     # Chat operations
     def append_chat(self, transcript_id: str, role: str, content: List[Dict[str, Any]],
@@ -291,6 +346,10 @@ class MongoChatStore:
             "active": graph_payload.get("active", True),
             "updated_at": now,
             "last_synced_at": now,
+            "figure": graph_payload.get("figure"),
+            "config": graph_payload.get("config"),
+            "summary": graph_payload.get("summary"),
+            "html_content": graph_payload.get("html_content"),
         }
 
         if data_list is not None:
@@ -300,10 +359,6 @@ class MongoChatStore:
                 sample = data_list[0]
                 if isinstance(sample, dict):
                     base_doc["fields"] = sorted(sample.keys())
-
-        html_blob = graph_payload.get("html_content") or graph_payload.get("html")
-        if html_blob:
-            base_doc["html_content"] = html_blob
 
         update_doc = {
             "$set": self._to_bson_safe(base_doc),
@@ -319,7 +374,9 @@ class MongoChatStore:
         stored = self.graphs.find_one({"user_id": user_id, "title_normalized": normalized})
         if not stored:
             raise PyMongoError("Failed to persist dashboard graph metadata")
-        return self._from_bson(stored)
+        clean = self._from_bson(stored)
+        self._persist_graph_json(clean)
+        return clean
 
     def bulk_register_dashboard_graphs(self, user_id: str, graph_payloads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Register multiple dashboard graphs in sequence and return the stored documents."""
@@ -418,7 +475,10 @@ class MongoChatStore:
                 "graph_id": graph.get("graph_id"),
                 "title": graph.get("title"),
                 "graph_type": graph.get("graph_type"),
-                "html": (graph.get("html_content") or "")[:20000],
+                "figure": graph.get("figure"),
+                "config": graph.get("config"),
+                "summary": graph.get("summary"),
+                "html": graph.get("html_content") or graph.get("html"),
                 "data_source": graph.get("data_source"),
                 "row_count": graph.get("row_count"),
                 "fields": graph.get("fields"),
@@ -438,6 +498,12 @@ class MongoChatStore:
         - datetime.datetime -> ensure timezone-aware (UTC if naive)
         - lists/dicts traversed
         """
+        # Handle numpy scalar types
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return [self._to_bson_safe(x) for x in obj.tolist()]
+
         # Decimal first
         if isinstance(obj, Decimal):
             return Decimal128(str(obj))
@@ -471,4 +537,44 @@ class MongoChatStore:
             return [self._from_bson(x) for x in obj]
         if isinstance(obj, dict):
             return {k: self._from_bson(v) for k, v in obj.items() if k != "_id"}
+        return obj
+
+    def _persist_graph_json(self, doc: Dict[str, Any]) -> None:
+        if not isinstance(doc, dict) or not self.graph_storage_dir:
+            return
+        graph_id = doc.get("graph_id")
+        if not graph_id:
+            return
+        snapshot = self._json_ready(doc)
+        try:
+            path = self.graph_storage_dir / f"{graph_id}.json"
+            with path.open("w", encoding="utf-8") as handle:
+                json.dump(snapshot, handle, ensure_ascii=False, indent=2)
+            logger.info("Stored dashboard graph JSON at %s", path)
+        except Exception as exc:
+            logger.warning("Failed to persist graph JSON for %s: %s", graph_id, exc)
+
+    def _json_ready(self, obj: Any) -> Any:
+        if isinstance(obj, np.generic):
+            return self._json_ready(obj.item())
+        if isinstance(obj, np.ndarray):
+            return [self._json_ready(x) for x in obj.tolist()]
+        if isinstance(obj, Decimal):
+            return str(obj)
+        if isinstance(obj, datetime):
+            if obj.tzinfo is None:
+                obj = obj.replace(tzinfo=timezone.utc)
+            return obj.isoformat()
+        if isinstance(obj, date) and not isinstance(obj, datetime):
+            return datetime.combine(obj, time.min, tzinfo=timezone.utc).isoformat()
+        if isinstance(obj, time):
+            if obj.tzinfo is None:
+                obj = obj.replace(tzinfo=timezone.utc)
+            return obj.isoformat()
+        if isinstance(obj, uuid.UUID):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {k: self._json_ready(v) for k, v in obj.items() if k != "_id"}
+        if isinstance(obj, (list, tuple, set)):
+            return [self._json_ready(v) for v in obj]
         return obj
