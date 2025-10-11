@@ -124,12 +124,16 @@ class GraphsResponse(BaseModel):
 
 class PendingResultBundle(BaseModel):
     status: Literal["pending", "ready"]
+    role: Optional[Literal["user", "assistant"]] = None
     transcript_id: Optional[str] = None
     chat_id: Optional[str] = None
+    chat_id_user: Optional[str] = None
     sql: Optional[SQLResponse] = None
     tables: Optional[TablesResponse] = None
     description: Optional[DescriptionResponse] = None
     graphs: Optional[GraphsResponse] = None
+    user_message: Optional[str] = None
+    description_summary: Optional[str] = None
     enqueued_at: Optional[datetime] = None
 
 class LiveKitSessionCreateRequest(BaseModel):
@@ -190,17 +194,34 @@ class _PendingQueueItem(TypedDict):
     transcript_id: str
     chat_id: str
     enqueued_at: datetime
+    role: Literal["user", "assistant"]
+    summary: Optional[str]
+    related_chat_id_user: Optional[str]
+    user_message: Optional[str]
 
 _pending_result_queue: DefaultDict[str, Deque[_PendingQueueItem]] = defaultdict(deque)
 _pending_result_lock = asyncio.Lock()
 
 
-async def _enqueue_pending_result(user_id: str, transcript_id: str, chat_id: str) -> None:
+async def _enqueue_pending_result(
+    user_id: str,
+    transcript_id: str,
+    chat_id: str,
+    *,
+    role: Literal["user", "assistant"],
+    summary: Optional[str] = None,
+    related_chat_id_user: Optional[str] = None,
+    user_message: Optional[str] = None,
+) -> None:
     async with _pending_result_lock:
         _pending_result_queue[user_id].append({
             "transcript_id": transcript_id,
             "chat_id": chat_id,
             "enqueued_at": datetime.utcnow(),
+            "role": role,
+            "summary": summary,
+            "related_chat_id_user": related_chat_id_user,
+            "user_message": user_message,
         })
 
 
@@ -217,6 +238,21 @@ async def _pop_pending_result(user_id: str) -> Optional[_PendingQueueItem]:
             _pending_result_queue.pop(user_id, None)
         return item
 
+
+
+def _summarize_text(text: Optional[str], max_length: int = 240) -> Optional[str]:
+    if not text:
+        return None
+    summary = re.sub(r"\s+", " ", text.strip())
+    if not summary:
+        return None
+    if len(summary) <= max_length:
+        return summary
+    truncated = summary[:max_length].rstrip()
+    if " " in truncated:
+        truncated = truncated.rsplit(" ", 1)[0]
+    truncated = truncated.rstrip(",.; ")
+    return f"{truncated}..."
 
 def _resolve_livekit_client_bundle() -> Optional[str]:
     configured = os.getenv("LIVEKIT_CLIENT_BUNDLE_PATH", "").strip()
@@ -598,6 +634,13 @@ async def process_query(request: QueryRequest, http: Request = None):
             meta={"source": "api", **(request.metadata or {})},
             user_id=user_id,
         )
+        await _enqueue_pending_result(
+            user_id,
+            transcript_id,
+            chat_id_user,
+            role="user",
+            user_message=request.natural_language_query,
+        )
 
         # Process the query
         result = processor.process_query_with_smart_visualization(
@@ -934,7 +977,15 @@ async def process_query(request: QueryRequest, http: Request = None):
             if dashboard_action_result:
                 message = f"{message} {dashboard_action_result}".strip()
 
-        await _enqueue_pending_result(user_id, transcript_id, chat_id_assistant)
+        await _enqueue_pending_result(
+            user_id,
+            transcript_id,
+            chat_id_assistant,
+            role="assistant",
+            summary=_summarize_text(desc_text),
+            related_chat_id_user=chat_id_user,
+            user_message=request.natural_language_query,
+        )
 
         return QueryProcessResponse(
             transcript_id=transcript_id,
@@ -1099,6 +1150,29 @@ async def poll_query_results(http: Request = None):
 
     transcript_id = pending["transcript_id"]
     chat_id = pending["chat_id"]
+    role = pending.get("role")
+
+    if role == "user":
+        user_text = (pending.get("user_message") or "").strip()
+        if not user_text:
+            chat = store.get_chat(transcript_id, chat_id, user_id=user_id)
+            if chat:
+                for item in chat.get("content", []):
+                    if item.get("type") == "text":
+                        payload = item.get("payload") or {}
+                        candidate = (payload.get("text") or "").strip()
+                        if candidate:
+                            user_text = candidate
+                            break
+        return PendingResultBundle(
+            status="ready",
+            role="user",
+            transcript_id=transcript_id,
+            chat_id=chat_id,
+            chat_id_user=chat_id,
+            user_message=user_text or None,
+            enqueued_at=pending.get("enqueued_at"),
+        )
 
     async def _safe_call(coro):
         try:
@@ -1115,14 +1189,37 @@ async def poll_query_results(http: Request = None):
         _safe_call(get_graph_html(transcript_id, chat_id, http)),
     )
 
+    description_summary = None
+    if description_result and getattr(description_result, "description", None):
+        description_summary = _summarize_text(description_result.description)
+    if not description_summary:
+        description_summary = _summarize_text(pending.get("summary"))
+
+    chat_id_user = pending.get("related_chat_id_user")
+    user_message_text = (pending.get("user_message") or "").strip()
+    if chat_id_user and not user_message_text:
+        user_chat = store.get_chat(transcript_id, chat_id_user, user_id=user_id)
+        if user_chat:
+            for item in user_chat.get("content", []):
+                if item.get("type") == "text":
+                    payload = item.get("payload") or {}
+                    candidate = (payload.get("text") or "").strip()
+                    if candidate:
+                        user_message_text = candidate
+                        break
+
     return PendingResultBundle(
         status="ready",
+        role="assistant",
         transcript_id=transcript_id,
         chat_id=chat_id,
+        chat_id_user=chat_id_user,
         sql=sql_result,
         tables=tables_result,
         description=description_result,
         graphs=graphs_result,
+        user_message=user_message_text or None,
+        description_summary=description_summary,
         enqueued_at=pending.get("enqueued_at"),
     )
 

@@ -3,10 +3,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any, Optional
+from typing import Any, Optional, List
 
 import requests
 from livekit.agents import RunContext, function_tool
@@ -43,6 +44,17 @@ async def check_health_status(
 INDUS_BACKEND_URL = os.getenv("INDUS_BACKEND_URL")
 FALLBACK_BEARER_TOKEN = os.getenv("INDUS_BACKEND_BEARER_TOKEN")
 FALLBACK_TRANSCRIPT_ID = os.getenv("INDUS_BACKEND_TRANSCRIPT_ID")
+
+
+def _summarize_text(text: Optional[str], max_sentences: int = 2) -> Optional[str]:
+    if not text:
+        return None
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if not cleaned:
+        return None
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+    summary = " ".join(sentences[:max_sentences]).strip()
+    return summary or cleaned
 
 
 @function_tool()
@@ -122,14 +134,65 @@ async def process_user_query(
             data = response.json()
         except ValueError:
             data = response.text.strip()
+            logging.warning("Process Query API returned non-JSON payload: %s", data)
+            return str(data)
 
-        if isinstance(data, (dict, list)):
-            result = json.dumps(data)
-        else:
-            result = str(data)
+        description_text: Optional[str] = None
+        supplemental_hint: Optional[str] = None
 
-        logging.info("Process Query API success")
-        return result
+        if isinstance(data, dict):
+            transcript_id = data.get("transcript_id")
+            chat_id_assistant = data.get("chat_id_assistant")
+            status = data.get("status")
+            message = (data.get("message") or "").strip()
+            if transcript_id and chat_id_assistant:
+                description_url = backend_url.rstrip("/") + f"/get_description/{transcript_id}/{chat_id_assistant}"
+                tables_url = backend_url.rstrip("/") + f"/get_tables/{transcript_id}/{chat_id_assistant}"
+                try:
+                    desc_response = await asyncio.to_thread(
+                        requests.get,
+                        description_url,
+                        headers=headers,
+                        timeout=10,
+                    )
+                    if desc_response.ok:
+                        desc_json = desc_response.json()
+                        description_text = _summarize_text(desc_json.get("description"))
+                except Exception as exc:
+                    logging.warning("Failed to fetch description for transcript %s chat %s: %s", transcript_id, chat_id_assistant, exc)
+
+                try:
+                    tables_response = await asyncio.to_thread(
+                        requests.get,
+                        tables_url,
+                        headers=headers,
+                        timeout=10,
+                    )
+                    if tables_response.ok:
+                        tables_json = tables_response.json()
+                        record_count = tables_json.get("record_count")
+                        if isinstance(record_count, int):
+                            supplemental_hint = f"{record_count} record{'s' if record_count != 1 else ''} returned."
+                except Exception as exc:
+                    logging.debug("Failed to fetch tables metadata: %s", exc)
+
+            summary_parts: List[str] = []
+            if description_text:
+                summary_parts.append(description_text)
+            if supplemental_hint:
+                summary_parts.append(supplemental_hint)
+            if not summary_parts and message:
+                summary_parts.append(message)
+            final_summary = " ".join(summary_parts) if summary_parts else "Query processed successfully."
+            if len(final_summary) > 400:
+                final_summary = final_summary[:397].rstrip() + "..."
+            if status and status not in {"success", ""}:
+                final_summary = f"{status.capitalize()}: {final_summary}"
+            logging.info("Process Query API success")
+            return final_summary
+
+        logging.info("Process Query API success with non-dict response")
+        return json.dumps(data)
     except Exception as exc:
         logging.error("Process Query API call failed: %s", exc)
         return "Process Query API call failed; please try again later."
