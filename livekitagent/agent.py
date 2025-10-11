@@ -1,17 +1,18 @@
 from dotenv import load_dotenv
 import os
 import logging
+import asyncio
 from typing import Any, Dict, Optional
 
 import httpx
+import requests
 
 from livekit import agents
 from livekit.agents import AgentSession, Agent, RoomInputOptions, JobContext
-try:
-    from livekit.agents import FunctionTool  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-    FunctionTool = None  # type: ignore
-from livekit.plugins import noise_cancellation, groq, openai, silero
+from livekit.plugins import noise_cancellation, openai, silero, google
+
+# ✅ import your custom tools here
+from tools import process_user_query, check_health_status
 
 from prompts import AGENT_INSTRUCTION, SESSION_INSTRUCTION, SESSION_GREETING
 
@@ -24,6 +25,12 @@ load_dotenv()
 INDUS_BACKEND_URL = os.getenv("INDUS_BACKEND_URL")
 AGENT_API_KEY = os.getenv("LIVEKIT_AGENT_API_KEY")
 ROOM_PREFIX = os.getenv("LIVEKIT_ROOM_PREFIX", "indus")
+BACKEND_AUTH_TOKEN = os.getenv("INDUS_BACKEND_BEARER_TOKEN", (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJzdWIiOiJ1c2VyX2RmOTM0ZGIwMmU5NSIsImVtYWlsIjoia3VtYXdhdGhhcnNoMjAwNEBnbWFpbC5jb20iLCJleHAiOjE3NjAxNzIyNTB9."
+    "MWJlqpkC7vovP9oqYhlfdrMXMC68X_nBeOuXiUBTcBI"
+))
+DEFAULT_TRANSCRIPT_ID = os.getenv("INDUS_BACKEND_TRANSCRIPT_ID", "transc_15d92c63-2f2d-496d-b83e-c20182ae5b9a")
 
 
 def _extract_session_id(room_name: Optional[str]) -> Optional[str]:
@@ -53,18 +60,54 @@ async def _agent_request(path: str, payload: Dict[str, Any]) -> Optional[Dict[st
 
 
 async def run_backend_query(question: str, session_id: str, context: Optional[str] = None) -> str:
-    payload: Dict[str, Any] = {"question": question}
-    if context:
-        payload["context"] = context
-    data = await _agent_request(f"/livekit/session/{session_id}/query", payload)
-    if not data:
-        return "Query submitted to analytics backend."
+    """Invoke the FastAPI /process_query endpoint via requests in a worker thread."""
+    if not INDUS_BACKEND_URL:
+        logger.warning("Cannot submit backend query; INDUS_BACKEND_URL is unset.")
+        return "Backend is not configured."
+
+    api_url = f"{INDUS_BACKEND_URL.rstrip('/')}/process_query"
+    conversation_context = context or "User asked about sales by category"
+    payload: Dict[str, Any] = {
+        "natural_language_query": question,
+        "transcript_id": DEFAULT_TRANSCRIPT_ID,
+        "title": "Sales by category query",
+        "metadata": {},
+        "conversation_context": conversation_context,
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {BACKEND_AUTH_TOKEN}",
+    }
+
+    def _call_process_query() -> Dict[str, Any]:
+        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        logger.info("process_query status=%s", response.status_code)
+        try:
+            data = response.json()
+        except ValueError:
+            logger.error("process_query returned non-JSON payload: %s", response.text)
+            response.raise_for_status()
+            return {}
+        logger.info("process_query response=%s", data)
+        response.raise_for_status()
+        return data
+
+    try:
+        data = await asyncio.to_thread(_call_process_query)
+    except requests.RequestException as exc:
+        logger.error("process_query request failed: %s", exc)
+        return "Unable to reach analytics backend."
+
     result = data.get("result") if isinstance(data, dict) else None
     if isinstance(result, dict):
         for key in ("description", "message", "dashboard_result", "summary"):
             value = result.get(key)
             if isinstance(value, str) and value.strip():
                 return value
+    message = data.get("message") if isinstance(data, dict) else None
+    if isinstance(message, str) and message.strip():
+        return message
     return "Query processed."
 
 
@@ -80,11 +123,21 @@ async def post_transcript(role: str, text: str, session_id: str, metadata: Optio
     await _agent_request(f"/livekit/session/{session_id}/transcripts", payload)
 
 
+# ------------------------------
+# Assistant definition (Google Realtime LLM)
+# ------------------------------
 class Assistant(Agent):
-    def __init__(self, tools: Optional[list[Any]] = None) -> None:
+    def __init__(self) -> None:
         super().__init__(
             instructions=AGENT_INSTRUCTION,
-            tools=tools or [],
+            llm=google.beta.realtime.RealtimeModel(
+                voice="Aoede",
+                temperature=0.8,
+            ),
+            tools=[
+                process_user_query,
+                check_health_status,
+            ],
         )
 
 
@@ -127,29 +180,16 @@ async def entrypoint(ctx: agents.JobContext):
     else:
         logger.warning("Unable to determine session id from room name %s", room_name)
 
-    tools: list[Any] = []
-    if session_id and FunctionTool is not None:
-        async def query_backend(question: str) -> str:
-            return await run_backend_query(question, session_id)
-
-        try:
-            tools.append(
-                FunctionTool(
-                    name="query_indus_data",
-                    description="Query the Indus analytics warehouse and return a concise insight.",
-                    fn=query_backend,
-                )
-            )
-        except Exception as exc:  # pragma: no cover - defensive guard
-            logger.warning("Failed to register backend query tool: %s", exc)
-
     session = AgentSession(
-        llm=groq.LLM(model="openai/gpt-oss-20b"),
+        llm=google.beta.realtime.RealtimeModel(
+            voice="Aoede",
+            temperature=0.8,
+        ),
         stt=openai.STT(model="gpt-4o-transcribe"),
         tts=openai.TTS(model="tts-1", voice="nova"),
         vad=silero.VAD.load(),
     )
-    assistant = Assistant(tools=tools)
+    assistant = Assistant()
 
     await session.start(
         room=ctx.room,
