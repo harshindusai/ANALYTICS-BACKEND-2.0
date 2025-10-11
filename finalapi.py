@@ -1,6 +1,7 @@
 
 import asyncio
-from typing import Dict, Any, List, Optional, Literal
+from collections import defaultdict, deque
+from typing import Dict, Any, List, Optional, Literal, DefaultDict, Deque, TypedDict
 from decimal import Decimal
 from bson.decimal128 import Decimal128
 import uuid
@@ -121,6 +122,16 @@ class GraphsResponse(BaseModel):
     chat_id: str
     graphs: List[GraphItem]
 
+class PendingResultBundle(BaseModel):
+    status: Literal["pending", "ready"]
+    transcript_id: Optional[str] = None
+    chat_id: Optional[str] = None
+    sql: Optional[SQLResponse] = None
+    tables: Optional[TablesResponse] = None
+    description: Optional[DescriptionResponse] = None
+    graphs: Optional[GraphsResponse] = None
+    enqueued_at: Optional[datetime] = None
+
 class LiveKitSessionCreateRequest(BaseModel):
     display_name: Optional[str] = None
     transcript_id: Optional[str] = None
@@ -174,6 +185,37 @@ class LiveKitSessionMetadataResponse(BaseModel):
 processor = SmartNL2SQLProcessor()
 dashboard_query_engine = DashboardQueryEngine(store=store)
 livekit_manager = LiveKitSessionManager(store=store)
+
+class _PendingQueueItem(TypedDict):
+    transcript_id: str
+    chat_id: str
+    enqueued_at: datetime
+
+_pending_result_queue: DefaultDict[str, Deque[_PendingQueueItem]] = defaultdict(deque)
+_pending_result_lock = asyncio.Lock()
+
+
+async def _enqueue_pending_result(user_id: str, transcript_id: str, chat_id: str) -> None:
+    async with _pending_result_lock:
+        _pending_result_queue[user_id].append({
+            "transcript_id": transcript_id,
+            "chat_id": chat_id,
+            "enqueued_at": datetime.utcnow(),
+        })
+
+
+async def _pop_pending_result(user_id: str) -> Optional[_PendingQueueItem]:
+    async with _pending_result_lock:
+        queue = _pending_result_queue.get(user_id)
+        if not queue:
+            return None
+        try:
+            item = queue.popleft()
+        except IndexError:
+            item = None
+        if not queue:
+            _pending_result_queue.pop(user_id, None)
+        return item
 
 
 def _resolve_livekit_client_bundle() -> Optional[str]:
@@ -892,6 +934,8 @@ async def process_query(request: QueryRequest, http: Request = None):
             if dashboard_action_result:
                 message = f"{message} {dashboard_action_result}".strip()
 
+        await _enqueue_pending_result(user_id, transcript_id, chat_id_assistant)
+
         return QueryProcessResponse(
             transcript_id=transcript_id,
             chat_id_user=chat_id_user,
@@ -1037,6 +1081,50 @@ async def get_graph_html(transcript_id: str, chat_id: str, http: Request = None)
             insight=desc_text or "No visual required.",
         )]
     return GraphsResponse(transcript_id=transcript_id, chat_id=chat_id, graphs=graphs)
+
+@app.get(
+    "/query_results/poll",
+    response_model=PendingResultBundle,
+    dependencies=[Depends(auth_required)],
+    tags=["Query"],
+    summary="Poll for completed assistant query bundles",
+    description="Dequeues the next available assistant response for the authenticated user and returns the SQL, tables, description, and graphs in a single payload.",
+)
+async def poll_query_results(http: Request = None):
+    user = _require_user(http)
+    user_id = user.get("id")
+    pending = await _pop_pending_result(user_id)
+    if not pending:
+        return PendingResultBundle(status="pending")
+
+    transcript_id = pending["transcript_id"]
+    chat_id = pending["chat_id"]
+
+    async def _safe_call(coro):
+        try:
+            return await coro
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
+    sql_result, tables_result, description_result, graphs_result = await asyncio.gather(
+        _safe_call(get_sql_query(transcript_id, chat_id, http)),
+        _safe_call(get_tables(transcript_id, chat_id, http)),
+        _safe_call(get_description(transcript_id, chat_id, http)),
+        _safe_call(get_graph_html(transcript_id, chat_id, http)),
+    )
+
+    return PendingResultBundle(
+        status="ready",
+        transcript_id=transcript_id,
+        chat_id=chat_id,
+        sql=sql_result,
+        tables=tables_result,
+        description=description_result,
+        graphs=graphs_result,
+        enqueued_at=pending.get("enqueued_at"),
+    )
 
 
 
@@ -1230,6 +1318,7 @@ async def root():
             "GET /get_tables/{transcript_id}/{chat_id}": "Get extracted table data",
             "GET /get_description/{transcript_id}/{chat_id}": "Get LLM description",
             "GET /get_graph/{transcript_id}/{chat_id}": "Get graph payload (Plotly JSON or summary data)",
+            "GET /query_results/poll": "Poll aggregated assistant response payloads",
             "GET /transcripts": "List transcripts",
             "POST /transcripts": "Create a new transcript",
             "GET /transcripts/{transcript_id}": "Get a transcript",
