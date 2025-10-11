@@ -123,6 +123,7 @@ class GraphsResponse(BaseModel):
 
 class LiveKitSessionCreateRequest(BaseModel):
     display_name: Optional[str] = None
+    transcript_id: Optional[str] = None
 
 
 class LiveKitSessionStartResponse(BaseModel):
@@ -135,6 +136,7 @@ class LiveKitSessionStartResponse(BaseModel):
     created_at: datetime
     expires_at: datetime
     transcripts: List[Dict[str, Any]]
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class LiveKitTranscriptIngest(BaseModel):
@@ -160,6 +162,13 @@ class LiveKitTokenResponse(BaseModel):
     token: str
     url: str
     expires_at: datetime
+
+
+class LiveKitSessionMetadataResponse(BaseModel):
+    session_id: str
+    user_id: str
+    metadata: Dict[str, Any]
+    transcript_id: Optional[str] = None
 
 
 processor = SmartNL2SQLProcessor()
@@ -1502,10 +1511,37 @@ async def update_dashboard(payload: DashboardGraphsPayload, request: Request):
 )
 async def create_livekit_session(payload: LiveKitSessionCreateRequest, request: Request):
     user = _require_user(request)
+    auth_header = request.headers.get("authorization")
+    bearer_token: Optional[str] = None
+    if auth_header:
+        parts = auth_header.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            bearer_token = parts[1].strip() or None
+    transcript_id: Optional[str] = None
+    if payload.transcript_id:
+        transcript = store.get_transcript(payload.transcript_id, user_id=user["id"])
+        if transcript:
+            transcript_id = payload.transcript_id
+        else:
+            logger.warning(
+                "User %s attempted to start LiveKit session with unknown transcript %s",
+                user["id"],
+                payload.transcript_id,
+            )
+    if not transcript_id:
+        title = payload.display_name or user.get("name") or "Live session"
+        metadata = {"source": "livekit", "created_via": "livekit_session"}
+        transcript_id = store.create_transcript(title=title, metadata=metadata, user_id=user["id"])
+    session_metadata: Dict[str, Any] = {}
+    if bearer_token:
+        session_metadata["auth_token"] = bearer_token
+    if transcript_id:
+        session_metadata["transcript_id"] = transcript_id
     try:
         session = await livekit_manager.create_session(
             user_id=user["id"],
             display_name=payload.display_name or user.get("name"),
+            metadata=session_metadata or None,
         )
     except LiveKitConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -1566,6 +1602,28 @@ async def issue_livekit_token(
         token=token,
         url=url,
         expires_at=expires_at,
+    )
+
+
+@app.get(
+    "/livekit/session/{session_id}/metadata",
+    tags=["LiveKit"],
+    summary="Retrieve LiveKit session metadata for agent",
+    response_model=LiveKitSessionMetadataResponse,
+)
+async def get_livekit_session_metadata(session_id: str, request: Request):
+    _require_agent(request)
+    try:
+        session = livekit_manager.get_session(session_id)
+    except LiveKitSessionNotFound:
+        raise HTTPException(status_code=404, detail="Session not found")
+    metadata = dict(session.metadata or {})
+    transcript_id = metadata.get("transcript_id") or session.transcript_id
+    return LiveKitSessionMetadataResponse(
+        session_id=session.session_id,
+        user_id=session.user_id,
+        metadata=metadata,
+        transcript_id=transcript_id,
     )
 
 

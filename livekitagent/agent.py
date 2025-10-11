@@ -25,12 +25,8 @@ load_dotenv()
 INDUS_BACKEND_URL = os.getenv("INDUS_BACKEND_URL")
 AGENT_API_KEY = os.getenv("LIVEKIT_AGENT_API_KEY")
 ROOM_PREFIX = os.getenv("LIVEKIT_ROOM_PREFIX", "indus")
-BACKEND_AUTH_TOKEN = os.getenv("INDUS_BACKEND_BEARER_TOKEN", (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-    "eyJzdWIiOiJ1c2VyX2RmOTM0ZGIwMmU5NSIsImVtYWlsIjoia3VtYXdhdGhhcnNoMjAwNEBnbWFpbC5jb20iLCJleHAiOjE3NjAxNzIyNTB9."
-    "MWJlqpkC7vovP9oqYhlfdrMXMC68X_nBeOuXiUBTcBI"
-))
-DEFAULT_TRANSCRIPT_ID = os.getenv("INDUS_BACKEND_TRANSCRIPT_ID", "transc_15d92c63-2f2d-496d-b83e-c20182ae5b9a")
+BACKEND_AUTH_TOKEN = os.getenv("INDUS_BACKEND_BEARER_TOKEN")
+DEFAULT_TRANSCRIPT_ID = os.getenv("INDUS_BACKEND_TRANSCRIPT_ID")
 
 
 def _extract_session_id(room_name: Optional[str]) -> Optional[str]:
@@ -42,7 +38,12 @@ def _extract_session_id(room_name: Optional[str]) -> Optional[str]:
     return None
 
 
-async def _agent_request(path: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+async def _agent_request(
+    path: str,
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    method: str = "POST",
+) -> Optional[Dict[str, Any]]:
     if not INDUS_BACKEND_URL or not AGENT_API_KEY:
         logger.debug("Backend integration skipped; missing INDUS_BACKEND_URL or LIVEKIT_AGENT_API_KEY.")
         return None
@@ -50,13 +51,33 @@ async def _agent_request(path: str, payload: Dict[str, Any]) -> Optional[Dict[st
     headers = {"x-agent-key": AGENT_API_KEY, "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, json=payload, headers=headers)
+            method_upper = method.upper()
+            if method_upper == "GET":
+                response = await client.get(url, headers=headers, params=payload or None)
+            else:
+                json_payload = payload if payload is not None else {}
+                response = await client.request(method_upper, url, json=json_payload, headers=headers)
             response.raise_for_status()
             if response.headers.get("content-type", "").startswith("application/json"):
                 return response.json()
     except Exception as exc:
         logger.warning("Backend request %s failed: %s", path, exc)
     return None
+
+
+async def _fetch_session_metadata(session_id: str) -> Dict[str, Any]:
+    response = await _agent_request(f"/livekit/session/{session_id}/metadata", method="GET")
+    if not isinstance(response, dict):
+        return {}
+    metadata = response.get("metadata")
+    metadata_dict = dict(metadata) if isinstance(metadata, dict) else {}
+    transcript_id = response.get("transcript_id")
+    if transcript_id and "transcript_id" not in metadata_dict:
+        metadata_dict["transcript_id"] = transcript_id
+    auth_token = metadata_dict.get("auth_token") or metadata_dict.get("authorization")
+    if auth_token:
+        metadata_dict.setdefault("auth_token", auth_token)
+    return metadata_dict
 
 
 async def run_backend_query(question: str, session_id: str, context: Optional[str] = None) -> str:
@@ -179,6 +200,25 @@ async def entrypoint(ctx: agents.JobContext):
         logger.info("Resolved session id %s for room %s", session_id, room_name)
     else:
         logger.warning("Unable to determine session id from room name %s", room_name)
+    session_metadata: Dict[str, Any] = {}
+    if session_id:
+        fetched_metadata = await _fetch_session_metadata(session_id)
+        if fetched_metadata:
+            session_metadata = fetched_metadata
+        else:
+            logger.warning("No metadata available for LiveKit session %s", session_id)
+    auth_token = session_metadata.get("auth_token") or BACKEND_AUTH_TOKEN
+    transcript_id = session_metadata.get("transcript_id") or DEFAULT_TRANSCRIPT_ID
+    session_userdata = {
+        "session_id": session_id,
+        "auth_token": auth_token,
+        "transcript_id": transcript_id,
+        "metadata": session_metadata,
+    }
+    if not auth_token:
+        logger.warning("Missing backend auth token for LiveKit session %s", session_id or "<unknown>")
+    if not transcript_id:
+        logger.warning("Missing transcript id for LiveKit session %s", session_id or "<unknown>")
 
     session = AgentSession(
         llm=google.beta.realtime.RealtimeModel(
@@ -188,6 +228,7 @@ async def entrypoint(ctx: agents.JobContext):
         stt=openai.STT(model="gpt-4o-transcribe"),
         tts=openai.TTS(model="tts-1", voice="nova"),
         vad=silero.VAD.load(),
+        userdata=session_userdata,
     )
     assistant = Assistant()
 

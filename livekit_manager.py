@@ -60,6 +60,7 @@ class LiveKitSession:
     url: str
     created_at: datetime
     expires_at: datetime
+    metadata: Dict[str, Any] = field(default_factory=dict)
     agent_key_hash: Optional[bytes] = None
     watchers: Set[WebSocket] = field(default_factory=set)
     transcripts: list[TranscriptEntry] = field(default_factory=list)
@@ -77,6 +78,7 @@ class LiveKitSession:
             "created_at": self.created_at.astimezone(timezone.utc).isoformat(),
             "expires_at": self.expires_at.astimezone(timezone.utc).isoformat(),
             "transcripts": [entry.to_dict() for entry in self.transcripts],
+            "metadata": self.metadata,
         }
 
 
@@ -121,6 +123,7 @@ class LiveKitSessionManager:
             url=doc.get("url") or os.getenv("LIVEKIT_URL", ""),
             created_at=created_at,
             expires_at=expires_at,
+            metadata=doc.get("metadata") or {},
             transcripts=[],
             transcript_id=doc.get("transcript_id"),
             active=doc.get("active", True),
@@ -131,7 +134,12 @@ class LiveKitSessionManager:
     def get_session(self, session_id: str) -> LiveKitSession:
         return self._get_session(session_id)
 
-    async def create_session(self, user_id: str, display_name: Optional[str] = None) -> LiveKitSession:
+    async def create_session(
+        self,
+        user_id: str,
+        display_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> LiveKitSession:
         session_id = uuid.uuid4().hex
         participant_identity = f"user-{user_id}-{uuid.uuid4().hex[:6]}"
         token, url, room_name, expires_at = self._generate_access_token(
@@ -139,6 +147,11 @@ class LiveKitSessionManager:
             display_name=display_name,
             session_id=session_id,
         )
+        transcript_ref = None
+        if metadata and isinstance(metadata, dict):
+            transcript_value = metadata.get("transcript_id")
+            if isinstance(transcript_value, str) and transcript_value:
+                transcript_ref = transcript_value
         session = LiveKitSession(
             session_id=session_id,
             user_id=user_id,
@@ -149,6 +162,8 @@ class LiveKitSessionManager:
             url=url,
             created_at=_utcnow(),
             expires_at=expires_at,
+            metadata=metadata or {},
+            transcript_id=transcript_ref,
         )
         async with self._lock:
             self._sessions[session_id] = session
@@ -163,6 +178,8 @@ class LiveKitSessionManager:
             "created_at": session.created_at,
             "expires_at": session.expires_at,
             "active": True,
+            "metadata": session.metadata,
+            "transcript_id": session.transcript_id,
         })
         logger.info("Created LiveKit session %s for user %s", session_id, user_id)
         return session
@@ -316,17 +333,25 @@ class LiveKitSessionManager:
             return None
 
         def _store() -> Optional[str]:
-            title = f"Live session {session.created_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-            metadata = {
-                "source": "livekit",
-                "session_id": session.session_id,
-                "room_name": session.room_name,
-            }
-            transcript_id = self.store.create_transcript(
-                title=title,
-                metadata=metadata,
-                user_id=session.user_id,
-            )
+            transcript_id = session.transcript_id
+            if transcript_id:
+                existing = self.store.get_transcript(transcript_id, user_id=session.user_id)
+            else:
+                existing = None
+            if not existing:
+                title = f"Live session {session.created_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                metadata = {
+                    "source": "livekit",
+                    "session_id": session.session_id,
+                    "room_name": session.room_name,
+                }
+                transcript_id = self.store.create_transcript(
+                    title=title,
+                    metadata=metadata,
+                    user_id=session.user_id,
+                )
+            if not transcript_id:
+                return None
             for entry in session.transcripts:
                 role = entry.role if entry.role in {"user", "assistant"} else "assistant"
                 content = [{
@@ -362,6 +387,7 @@ class LiveKitSessionManager:
             "expires_at": session.expires_at,
             "active": session.active,
             "transcript_id": transcript_id,
+            "metadata": session.metadata,
         })
         return transcript_id
 

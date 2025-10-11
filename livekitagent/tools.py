@@ -40,16 +40,9 @@ async def check_health_status(
         return "Health check failed; please check the service manually."
 
 
-PROCESS_QUERY_URL = "https://unliquescent-bart-grizzled.ngrok-free.dev/process_query"
-PROCESS_QUERY_TRANSCRIPT_ID = "transc_15d92c63-2f2d-496d-b83e-c20182ae5b9a"
-PROCESS_QUERY_HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": (
-        "Bearer "
-        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyX2RmOTM0ZGIwMmU5NSIsImVtYWlsIjoia3VtYXdhdGhhcnNoMjAwNEBnbWFpbC5j"
-        "b20iLCJleHAiOjE3NjAxNzQ3OTl9.t80FQIO5Rr9WVm6gl37VP8i1ITUrHJkWm9MAPvk3hb0"
-    ),
-}
+INDUS_BACKEND_URL = os.getenv("INDUS_BACKEND_URL")
+FALLBACK_BEARER_TOKEN = os.getenv("INDUS_BACKEND_BEARER_TOKEN")
+FALLBACK_TRANSCRIPT_ID = os.getenv("INDUS_BACKEND_TRANSCRIPT_ID")
 
 
 @function_tool()
@@ -64,26 +57,64 @@ async def process_user_query(
     Send a business or analytics question to the Process Query API to obtain SQL and metadata.
 
     Use this when the user asks for business insights, analytics, or database-backed answers.
-    The `transcript_id` is preset and should not be changed.
     """
     if not query:
         return "Cannot process an empty query."
+    backend_url = INDUS_BACKEND_URL or os.getenv("INDUS_BACKEND_URL")
+    if not backend_url:
+        logging.error("process_user_query missing INDUS_BACKEND_URL configuration")
+        return "Process Query API call failed; backend is not configured."
+
+    try:
+        userdata = context.userdata  # type: ignore[assignment]
+    except ValueError:
+        userdata = {}
+    if not isinstance(userdata, dict):
+        userdata = {}
+
+    session_metadata = userdata.get("metadata")
+    if not isinstance(session_metadata, dict):
+        session_metadata = {}
+
+    auth_token = userdata.get("auth_token") or session_metadata.get("auth_token") or FALLBACK_BEARER_TOKEN
+    transcript_id = (
+        userdata.get("transcript_id")
+        or session_metadata.get("transcript_id")
+        or FALLBACK_TRANSCRIPT_ID
+    )
+    if not auth_token:
+        logging.error("process_user_query missing authorization token in session metadata")
+        return "Process Query API call failed; authorization is unavailable."
+    if not transcript_id:
+        logging.error("process_user_query missing transcript id in session metadata")
+        return "Process Query API call failed; transcript context is unavailable."
 
     generated_title = title or "Sales Query"
+    request_metadata: dict[str, Any] = {}
+    if isinstance(metadata, dict):
+        request_metadata = dict(metadata)
+    if "source" not in request_metadata:
+        request_metadata["source"] = "voice-agent"
+
     payload = {
         "natural_language_query": query,
-        "transcript_id": PROCESS_QUERY_TRANSCRIPT_ID,
+        "transcript_id": transcript_id,
         "title": generated_title or "User query",
-        "metadata": metadata or {"source": "voice-agent"},
+        "metadata": request_metadata,
         "conversation_context": conversation_context or "User asked a business query.",
     }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {auth_token}",
+    }
+    process_query_url = backend_url.rstrip("/") + "/process_query"
 
     try:
         response = await asyncio.to_thread(
             requests.post,
-            PROCESS_QUERY_URL,
+            process_query_url,
             json=payload,
-            headers=PROCESS_QUERY_HEADERS,
+            headers=headers,
             timeout=15,
         )
         response.raise_for_status()
@@ -97,7 +128,7 @@ async def process_user_query(
         else:
             result = str(data)
 
-        logging.info("Process Query API success: %s", result)
+        logging.info("Process Query API success")
         return result
     except Exception as exc:
         logging.error("Process Query API call failed: %s", exc)
